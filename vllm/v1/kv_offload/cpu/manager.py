@@ -13,11 +13,13 @@ from vllm.v1.kv_offload.abstract import (
 from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.kv_offload.cpu.policies.sieve import SIEVECachePolicy
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
+    "sieve": SIEVECachePolicy,
 }
 
 
@@ -35,7 +37,7 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         block_size: int,
         num_blocks: int,
-        cache_policy: Literal["lru", "arc"] = "lru",
+        cache_policy: Literal["lru", "arc", "sieve"] = "lru",
         enable_events: bool = False,
     ):
         self.block_size: int = block_size
@@ -158,9 +160,9 @@ class CPUOffloadingManager(OffloadingManager):
             )
 
         blocks = self._allocate_blocks(block_hashes_to_store)
-        assert len(blocks) == len(block_hashes_to_store), (
-            "Block pool did not allocate the expected number of blocks"
-        )
+        assert len(blocks) == len(
+            block_hashes_to_store
+        ), "Block pool did not allocate the expected number of blocks"
 
         for block_hash, block in zip(block_hashes_to_store, blocks):
             self._policy.insert(block_hash, block)
