@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
-from typing import Literal
+from typing import Literal, cast
 
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
@@ -37,7 +38,7 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         block_size: int,
         num_blocks: int,
-        cache_policy: Literal["lru", "arc", "sieve"] = "lru",
+        cache_policy: Literal["lru", "arc", "sieve", None] = None,
         enable_events: bool = False,
     ):
         self.block_size: int = block_size
@@ -46,7 +47,9 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_allocated_blocks: int = 0
         self._free_list: list[int] = []
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
-        policy_cls = _CACHE_POLICIES.get(cache_policy)
+        if (raw_val := os.getenv("VLLM_KV_OFFLOAD_POLICY")) and raw_val:
+            cache_policy = cast(Literal["lru", "arc", "sieve"], raw_val.lower())
+        policy_cls = _CACHE_POLICIES.get(cache_policy or "")
         if policy_cls is None:
             raise ValueError(
                 f"Unknown cache policy: {cache_policy!r}. "
