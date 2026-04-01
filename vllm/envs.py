@@ -52,8 +52,10 @@ if TYPE_CHECKING:
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
     VLLM_CPU_SGL_KERNEL: bool = False
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
+    VLLM_CPU_INT4_W4A8: bool = True
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
+    VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -64,6 +66,9 @@ if TYPE_CHECKING:
     VLLM_IMAGE_FETCH_TIMEOUT: int = 5
     VLLM_VIDEO_FETCH_TIMEOUT: int = 30
     VLLM_AUDIO_FETCH_TIMEOUT: int = 10
+    VLLM_MEDIA_CACHE: str = ""
+    VLLM_MEDIA_CACHE_MAX_SIZE_MB: int = 5120
+    VLLM_MEDIA_CACHE_TTL_HOURS: float = 24
     VLLM_MEDIA_FETCH_MAX_RETRIES: int = 3
     VLLM_MEDIA_URL_ALLOW_REDIRECTS: bool = True
     VLLM_MEDIA_LOADING_THREAD_COUNT: int = 8
@@ -729,6 +734,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ZENTORCH_WEIGHT_PREPACK": lambda: bool(
         int(os.getenv("VLLM_ZENTORCH_WEIGHT_PREPACK", "1"))
     ),
+    # (CPU backend only) whether to use SGLang INT4 W4A8 kernels for AWQ.
+    "VLLM_CPU_INT4_W4A8": lambda: bool(int(os.getenv("VLLM_CPU_INT4_W4A8", "1"))),
     # If the env var is set, Ray Compiled Graph uses the specified
     # channel type to communicate between workers belonging to
     # different pipeline-parallel stages.
@@ -779,6 +786,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default is 10 seconds
     "VLLM_AUDIO_FETCH_TIMEOUT": lambda: int(
         os.getenv("VLLM_AUDIO_FETCH_TIMEOUT", "10")
+    ),
+    # Directory for caching media downloads (images, video, audio fetched
+    # from URLs during inference). Empty string disables caching.
+    "VLLM_MEDIA_CACHE": lambda: os.getenv("VLLM_MEDIA_CACHE", ""),
+    # Maximum cache size in MB. When exceeded, least-recently-used entries
+    # are evicted. Default is 5120 (5 GB).
+    "VLLM_MEDIA_CACHE_MAX_SIZE_MB": lambda: int(
+        os.getenv("VLLM_MEDIA_CACHE_MAX_SIZE_MB", "5120")
+    ),
+    # Time-to-live in hours for cached media files. Entries older than this
+    # are evicted regardless of cache size. Default is 24 hours.
+    "VLLM_MEDIA_CACHE_TTL_HOURS": lambda: float(
+        os.getenv("VLLM_MEDIA_CACHE_TTL_HOURS", "24")
     ),
     # Maximum number of retries for fetching media (images, audio, video)
     # from URLs. Each retry quadruples the timeout. Default is 3.
@@ -846,6 +866,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enable SPMD mode for TPU backend.
     "VLLM_XLA_USE_SPMD": lambda: bool(int(os.getenv("VLLM_XLA_USE_SPMD", "0"))),
+    # Maximum size (in MB) for logits tensor in sparse MLA indexer prefill chunks.
+    # Bounds the [M, N] float32 logits tensor to prevent CUDA OOM.
+    # Default: 512 MB
+    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
+        os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
     "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": lambda: bool(
@@ -1665,6 +1691,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Which cache eviction policy to use for KV cache
     "VLLM_KV_OFFLOAD_POLICY": lambda: os.getenv("VLLM_KV_OFFLOAD_POLICY"),
+    # Enable simple KV offload.
+    "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
+        int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
+    ),
 }
 
 
@@ -1787,6 +1817,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_IMAGE_FETCH_TIMEOUT",
         "VLLM_VIDEO_FETCH_TIMEOUT",
         "VLLM_AUDIO_FETCH_TIMEOUT",
+        "VLLM_MEDIA_CACHE",
+        "VLLM_MEDIA_CACHE_MAX_SIZE_MB",
+        "VLLM_MEDIA_CACHE_TTL_HOURS",
         "VLLM_MEDIA_FETCH_MAX_RETRIES",
         "VLLM_MEDIA_URL_ALLOW_REDIRECTS",
         "VLLM_MEDIA_LOADING_THREAD_COUNT",
