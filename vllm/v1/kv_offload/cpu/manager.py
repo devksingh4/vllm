@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
 import os
 from collections.abc import Iterable
 from typing import Literal, cast
@@ -11,11 +12,14 @@ from vllm.v1.kv_offload.abstract import (
     OffloadingManager,
     PrepareStoreOutput,
 )
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 from vllm.v1.kv_offload.cpu.policies.sieve import SIEVECachePolicy
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
+
+logger = init_logger(__name__)
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
@@ -56,6 +60,43 @@ class CPUOffloadingManager(OffloadingManager):
                 f"Supported: {list(_CACHE_POLICIES)}"
             )
         self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
+        self._policy_name = cache_policy or "unknown"
+
+        atexit.register(self._log_policy_stats)
+
+    def _log_policy_stats(self) -> None:
+        s = self._policy.stats
+        touch_evict_ratio = (
+            f"{s.touch_blocks / s.evict_blocks:.1f}"
+            if s.evict_blocks > 0
+            else "inf"
+        )
+        avg_scan = (
+            f"{s.evict_scan_steps / s.evict_calls:.1f}"
+            if s.evict_calls > 0
+            else "n/a"
+        )
+        logger.info(
+            "Policy stats [%s]: "
+            "touch=%d calls (%d blocks) | "
+            "evict=%d calls (%d blocks, %d failed) | "
+            "avg_scan_steps=%s | "
+            "touch:evict block ratio=%s | "
+            "inserts=%d removes=%d gets=%d | "
+            "cache_size_at_last_evict=%d",
+            self._policy_name,
+            s.touch_calls,
+            s.touch_blocks,
+            s.evict_calls,
+            s.evict_blocks,
+            s.evict_failed,
+            avg_scan,
+            touch_evict_ratio,
+            s.insert_calls,
+            s.remove_calls,
+            s.get_calls,
+            s.cache_size_at_last_evict,
+        )
 
     # --- block pool ---
 

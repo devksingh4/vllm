@@ -3,8 +3,24 @@
 import ctypes
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_utils import BlockHash
+
+
+@dataclass
+class PolicyStats:
+    """Counters for cache policy operations."""
+    touch_calls: int = 0
+    touch_blocks: int = 0
+    evict_calls: int = 0
+    evict_blocks: int = 0
+    evict_failed: int = 0
+    evict_scan_steps: int = 0
+    insert_calls: int = 0
+    remove_calls: int = 0
+    get_calls: int = 0
+    cache_size_at_last_evict: int = 0
 
 
 class BlockStatus(ctypes.Structure):
@@ -43,6 +59,8 @@ class CachePolicy(ABC):
 
     @abstractmethod
     def __init__(self, cache_capacity: int) -> None: ...
+
+    stats: PolicyStats
 
     @abstractmethod
     def get(self, block_hash: BlockHash) -> BlockStatus | None:
