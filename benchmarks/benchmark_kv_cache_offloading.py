@@ -87,6 +87,7 @@ def make_batches(
 def generate_zipfian_prefix_indices(
     num_prefixes: int, num_requests: int, alpha: float = 1.2, seed: int = 42
 ) -> list[int]:
+    """Generate Zipfian-distributed prefix indices. Higher alpha = more skewed."""
     np.random.seed(seed)
     ranks = np.arange(1, num_prefixes + 1)
     probs = 1.0 / (ranks**alpha)
@@ -101,6 +102,11 @@ def generate_temporal_prefix_indices(
     phase_length: int = 100,
     seed: int = 42,
 ) -> list[int]:
+    """
+    Generate indices with temporal locality (working set shifts over time).
+    80% of requests hit a small working set that moves every phase_length requests.
+    Tests how policies adapt to changing access patterns (ARC should excel).
+    """
     np.random.seed(seed)
     indices = []
     num_phases = (num_requests + phase_length - 1) // phase_length
@@ -131,6 +137,12 @@ def generate_scan_resistant_prefix_indices(
     scan_size: int = 50,
     seed: int = 42,
 ) -> list[int]:
+    """
+    Generate scan-resistant workload (70% hot set, 30% sequential scan).
+
+    Tests resistance to cache pollution from one-hit wonders.
+    SIEVE should significantly outperform LRU (10-30% higher hit rate).
+    """
     np.random.seed(seed)
     indices = []
     hot_set = list(range(working_set_size))
@@ -223,7 +235,7 @@ def parse_args() -> argparse.Namespace:
         "--kv-offloading-size",
         type=float,
         default=1,
-        help="CPU offload size in GiB (default: 1)",
+        help="CPU offload size in GiB (default: 1). Use 0.3-0.5 to force more evictions",
     )
     p.add_argument(
         "--workload-pattern",
@@ -413,6 +425,8 @@ if __name__ == "__main__":
             print(f"Touch:Evict ratio:      {touch_evict_ratio:.2f}")
         print(f"Cache size at last evict: {stats.cache_size_at_last_evict}")
 
+        # hit rate = touches / (inserts + touches)
+        # higher is better - means more KV blocks found in cache vs needing insertion
         total_accesses = stats.insert_calls + stats.touch_blocks
         if total_accesses > 0:
             hit_rate = stats.touch_blocks / total_accesses
