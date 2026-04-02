@@ -252,3 +252,6 @@ class CPUOffloadingManager(OffloadingManager):
         if self.events is not None:
             yield from self.events
             self.events.clear()
+
+    def get_policy_stats(self):
+        return self._policy.stats
