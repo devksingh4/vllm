@@ -115,7 +115,9 @@ def generate_temporal_prefix_indices(
         start_idx = (phase * working_set_size // 2) % max(
             1, num_prefixes - working_set_size
         )
-        hot_set = list(range(start_idx, min(start_idx + working_set_size, num_prefixes)))
+        hot_set = list(
+            range(start_idx, min(start_idx + working_set_size, num_prefixes))
+        )
         cold_set = [i for i in range(num_prefixes) if i not in hot_set]
 
         phase_requests = min(phase_length, num_requests - len(indices))
@@ -146,7 +148,9 @@ def generate_scan_resistant_prefix_indices(
     np.random.seed(seed)
     indices = []
     hot_set = list(range(working_set_size))
-    scan_set = list(range(working_set_size, min(working_set_size + scan_size, num_prefixes)))
+    scan_set = list(
+        range(working_set_size, min(working_set_size + scan_size, num_prefixes))
+    )
 
     scan_position = 0
     for i in range(num_requests):
@@ -194,14 +198,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--policy",
-        choices=["lru", "sieve", "arc"],
+        choices=["lru", "sieve", "arc", "s3fifo"],
         default="lru",
         help="Eviction policy (default: lru)",
     )
     p.add_argument(
         "--num-batches",
         type=int,
-        default=15,
+        default=5,
         help="Number of sequential batches (default: 15)",
     )
     p.add_argument(
@@ -235,7 +239,7 @@ def parse_args() -> argparse.Namespace:
         "--kv-offloading-size",
         type=float,
         default=1,
-        help="CPU offload size in GiB (default: 1). Use 0.3-0.5 to force more evictions",
+        help="CPU offload size in GiB (default: 1)",
     )
     p.add_argument(
         "--workload-pattern",
@@ -334,7 +338,9 @@ if __name__ == "__main__":
         prefix_counts = defaultdict(int)
         for idx in prefix_indices:
             prefix_counts[idx] += 1
-        print(f"Prefix access distribution: {dict(sorted(prefix_counts.items())[:5])}...")
+        print(
+            f"Prefix access distribution: {dict(sorted(prefix_counts.items())[:5])}..."
+        )
 
     print(f"\nLoading {MODEL_ID}...")
     llm = LLM(
@@ -396,42 +402,7 @@ if __name__ == "__main__":
     p50_idx = len(batch_times_sorted) // 2
     p95_idx = int(len(batch_times_sorted) * 0.95)
     p99_idx = int(len(batch_times_sorted) * 0.99)
-    print(f"\nLatency Percentiles:")
+    print("\nLatency Percentiles:")
     print(f"  P50 (median):         {batch_times_sorted[p50_idx]:.2f}s")
     print(f"  P95:                  {batch_times_sorted[p95_idx]:.2f}s")
     print(f"  P99:                  {batch_times_sorted[p99_idx]:.2f}s")
-
-    try:
-        connector = llm.llm_engine.engine_core.scheduler.get_kv_connector()
-        if connector and hasattr(connector, 'scheduler_connector'):
-            manager = connector.scheduler_connector.manager
-        else:
-            raise AttributeError("No offloading manager found")
-
-        stats = manager.get_policy_stats()
-
-        print(f"\n--- Cache Statistics ---")
-        print(f"Total get calls:        {stats.get_calls}")
-        print(f"Total inserts:          {stats.insert_calls}")
-        print(f"Total removes:          {stats.remove_calls}")
-        print(f"Touch calls:            {stats.touch_calls} ({stats.touch_blocks} blocks)")
-        print(f"Eviction calls:         {stats.evict_calls} ({stats.evict_blocks} blocks)")
-        print(f"Failed evictions:       {stats.evict_failed}")
-        if stats.evict_calls > 0:
-            avg_scan = stats.evict_scan_steps / stats.evict_calls
-            print(f"Avg scan steps/evict:   {avg_scan:.1f}")
-        if stats.evict_blocks > 0:
-            touch_evict_ratio = stats.touch_blocks / stats.evict_blocks
-            print(f"Touch:Evict ratio:      {touch_evict_ratio:.2f}")
-        print(f"Cache size at last evict: {stats.cache_size_at_last_evict}")
-
-        # hit rate = touches / (inserts + touches)
-        # higher is better - means more KV blocks found in cache vs needing insertion
-        total_accesses = stats.insert_calls + stats.touch_blocks
-        if total_accesses > 0:
-            hit_rate = stats.touch_blocks / total_accesses
-            print(f"\nEstimated hit rate:     {hit_rate:.2%}")
-            print(f"  (touches / (inserts + touches))")
-    except (AttributeError, TypeError):
-        print(f"\nNote: Could not retrieve cache statistics.")
-        print("Cache stats will be logged at program exit.")

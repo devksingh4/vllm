@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.kv_offload.cpu.policies.s3fifo import S3FIFOCachePolicy
 from vllm.v1.kv_offload.cpu.policies.sieve import SIEVECachePolicy
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 
@@ -25,6 +26,7 @@ _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
     "sieve": SIEVECachePolicy,
+    "s3fifo": S3FIFOCachePolicy,
 }
 
 
@@ -42,7 +44,7 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         block_size: int,
         num_blocks: int,
-        cache_policy: Literal["lru", "arc", "sieve", None] = None,
+        cache_policy: Literal["lru", "arc", "sieve", "s3fifo", None] = None,
         enable_events: bool = False,
     ):
         self.block_size: int = block_size
