@@ -78,6 +78,11 @@ class CPUOffloadingManager(OffloadingManager):
             if s.evict_calls > 0
             else "n/a"
         )
+        hit_rate = (
+            f"{s.lookup_hit_blocks / s.lookup_total_blocks:.2%}"
+            if s.lookup_total_blocks > 0
+            else "n/a"
+        )
         logger.info(
             "Policy stats [%s]: "
             "touch=%d calls (%d blocks) | "
@@ -85,7 +90,8 @@ class CPUOffloadingManager(OffloadingManager):
             "avg_scan_steps=%s | "
             "touch:evict block ratio=%s | "
             "inserts=%d removes=%d gets=%d | "
-            "cache_size_at_last_evict=%d",
+            "cache_size_at_last_evict=%d | "
+            "cpu_offload_hit_rate=%s (%d/%d blocks)",
             self._policy_name,
             s.touch_calls,
             s.touch_blocks,
@@ -98,6 +104,9 @@ class CPUOffloadingManager(OffloadingManager):
             s.remove_calls,
             s.get_calls,
             s.cache_size_at_last_evict,
+            hit_rate,
+            s.lookup_hit_blocks,
+            s.lookup_total_blocks,
         )
 
     # --- block pool ---
@@ -136,12 +145,15 @@ class CPUOffloadingManager(OffloadingManager):
     # --- OffloadingManager interface ---
 
     def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
+        block_hashes_list = list(block_hashes)
         hit_count = 0
-        for block_hash in block_hashes:
+        for block_hash in block_hashes_list:
             block = self._policy.get(block_hash)
             if block is None or not block.is_ready:
                 break
             hit_count += 1
+        self._policy.stats.lookup_hit_blocks += hit_count
+        self._policy.stats.lookup_total_blocks += len(block_hashes_list)
         return hit_count
 
     def prepare_load(self, block_hashes: Iterable[BlockHash]) -> LoadStoreSpec:

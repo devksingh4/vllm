@@ -238,8 +238,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--kv-offloading-size",
         type=float,
-        default=1,
-        help="CPU offload size in GiB (default: 1)",
+        default=2,
+        help="CPU offload size in GiB (default: 2)",
     )
     p.add_argument(
         "--workload-pattern",

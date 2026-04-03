@@ -11,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import BlockHash
 @dataclass
 class PolicyStats:
     """Counters for cache policy operations."""
+
     touch_calls: int = 0
     touch_blocks: int = 0
     evict_calls: int = 0
@@ -21,6 +22,8 @@ class PolicyStats:
     remove_calls: int = 0
     get_calls: int = 0
     cache_size_at_last_evict: int = 0
+    lookup_hit_blocks: int = 0
+    lookup_total_blocks: int = 0
 
 
 class BlockStatus(ctypes.Structure):
