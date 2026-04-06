@@ -224,7 +224,7 @@ class OffloadingConnectorScheduler:
             )
             store_output = self.manager.prepare_store(new_block_hashes)
             if store_output is None:
-                logger.warning(
+                logger.debug(
                     "Request %s: cannot store %s blocks", req_id, num_new_blocks
                 )
                 continue

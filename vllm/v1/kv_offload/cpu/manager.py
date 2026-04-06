@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
+import os
 from collections.abc import Iterable
-from typing import Literal
+from typing import Literal, cast
 
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
     LoadStoreSpec,
@@ -13,11 +16,17 @@ from vllm.v1.kv_offload.abstract import (
 from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.kv_offload.cpu.policies.s3fifo import S3FIFOCachePolicy
+from vllm.v1.kv_offload.cpu.policies.sieve import SIEVECachePolicy
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
+
+logger = init_logger(__name__)
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
+    "sieve": SIEVECachePolicy,
+    "s3fifo": S3FIFOCachePolicy,
 }
 
 
@@ -35,7 +44,7 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         block_size: int,
         num_blocks: int,
-        cache_policy: Literal["lru", "arc"] = "lru",
+        cache_policy: Literal["lru", "arc", "sieve", "s3fifo", None] = None,
         enable_events: bool = False,
     ):
         self.block_size: int = block_size
@@ -44,13 +53,57 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_allocated_blocks: int = 0
         self._free_list: list[int] = []
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
-        policy_cls = _CACHE_POLICIES.get(cache_policy)
+        if (raw_val := os.getenv("VLLM_KV_OFFLOAD_POLICY")) and raw_val:
+            cache_policy = cast(Literal["lru", "arc", "sieve"], raw_val.lower())
+        policy_cls = _CACHE_POLICIES.get(cache_policy or "")
         if policy_cls is None:
             raise ValueError(
                 f"Unknown cache policy: {cache_policy!r}. "
                 f"Supported: {list(_CACHE_POLICIES)}"
             )
         self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
+        self._policy_name = cache_policy or "unknown"
+
+        atexit.register(self._log_policy_stats)
+
+    def _log_policy_stats(self) -> None:
+        s = self._policy.stats
+        touch_evict_ratio = (
+            f"{s.touch_blocks / s.evict_blocks:.1f}" if s.evict_blocks > 0 else "inf"
+        )
+        avg_scan = (
+            f"{s.evict_scan_steps / s.evict_calls:.1f}" if s.evict_calls > 0 else "n/a"
+        )
+        hit_rate = (
+            f"{s.lookup_hit_blocks / s.lookup_total_blocks:.2%}"
+            if s.lookup_total_blocks > 0
+            else "n/a"
+        )
+        logger.info(
+            "Policy stats [%s]: "
+            "touch=%d calls (%d blocks) | "
+            "evict=%d calls (%d blocks, %d failed) | "
+            "avg_scan_steps=%s | "
+            "touch:evict block ratio=%s | "
+            "inserts=%d removes=%d gets=%d | "
+            "cache_size_at_last_evict=%d | "
+            "cpu_offload_hit_rate=%s (%d/%d blocks)",
+            self._policy_name,
+            s.touch_calls,
+            s.touch_blocks,
+            s.evict_calls,
+            s.evict_blocks,
+            s.evict_failed,
+            avg_scan,
+            touch_evict_ratio,
+            s.insert_calls,
+            s.remove_calls,
+            s.get_calls,
+            s.cache_size_at_last_evict,
+            hit_rate,
+            s.lookup_hit_blocks,
+            s.lookup_total_blocks,
+        )
 
     # --- block pool ---
 
@@ -88,12 +141,16 @@ class CPUOffloadingManager(OffloadingManager):
     # --- OffloadingManager interface ---
 
     def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
+        block_hashes_list = list(block_hashes)
         hit_count = 0
-        for block_hash in block_hashes:
+        for block_hash in block_hashes_list:
             block = self._policy.get(block_hash)
             if block is None or not block.is_ready:
                 break
             hit_count += 1
+        total_queried = hit_count + (1 if hit_count < len(block_hashes_list) else 0)
+        self._policy.stats.lookup_hit_blocks += hit_count
+        self._policy.stats.lookup_total_blocks += total_queried
         return hit_count
 
     def prepare_load(self, block_hashes: Iterable[BlockHash]) -> LoadStoreSpec:
@@ -158,11 +215,18 @@ class CPUOffloadingManager(OffloadingManager):
             )
 
         blocks = self._allocate_blocks(block_hashes_to_store)
-        assert len(blocks) == len(block_hashes_to_store), (
-            "Block pool did not allocate the expected number of blocks"
-        )
+        assert len(blocks) == len(
+            block_hashes_to_store
+        ), "Block pool did not allocate the expected number of blocks"
 
-        for block_hash, block in zip(block_hashes_to_store, blocks):
+        # Insert in reverse order (tail first, head last) so that within a
+        # prefix chain the head block is the newest entry in the policy's
+        # data structure.  Because lookup() stops at the first miss, evicting
+        # a head block destroys the cache value of every subsequent block in
+        # the chain.  Inserting head-last makes it the hardest block to evict
+        # across all policies (LRU, ARC, SIEVE, S3-FIFO, W-TinyLFU) without
+        # any changes to the policy interface.
+        for block_hash, block in zip(reversed(block_hashes_to_store), reversed(blocks)):
             self._policy.insert(block_hash, block)
 
         # build store specs for allocated blocks
@@ -206,3 +270,6 @@ class CPUOffloadingManager(OffloadingManager):
         if self.events is not None:
             yield from self.events
             self.events.clear()
+
+    def get_policy_stats(self):
+        return self._policy.stats

@@ -4,7 +4,11 @@ from collections import OrderedDict
 from collections.abc import Iterable
 
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
+from vllm.v1.kv_offload.cpu.policies.abstract import (
+    BlockStatus,
+    CachePolicy,
+    PolicyStats,
+)
 
 
 class ARCCachePolicy(CachePolicy):
@@ -53,20 +57,26 @@ class ARCCachePolicy(CachePolicy):
         # block_hash -> None (only care about presence)
         self.b1: OrderedDict[BlockHash, None] = OrderedDict()
         self.b2: OrderedDict[BlockHash, None] = OrderedDict()
+        self.stats = PolicyStats()
 
     def get(self, block_hash: BlockHash) -> BlockStatus | None:
+        self.stats.get_calls += 1
         return self.t1.get(block_hash) or self.t2.get(block_hash)
 
     def insert(self, block_hash: BlockHash, block: BlockStatus) -> None:
+        self.stats.insert_calls += 1
         self.t1[block_hash] = block
         self.b1.pop(block_hash, None)
         self.b2.pop(block_hash, None)
 
     def remove(self, block_hash: BlockHash) -> None:
+        self.stats.remove_calls += 1
         if self.t1.pop(block_hash, None) is None:
             self.t2.pop(block_hash, None)
 
     def touch(self, block_hashes: Iterable[BlockHash]) -> None:
+        self.stats.touch_calls += 1
+        count = 0
         for block_hash in reversed(list(block_hashes)):
             if block_hash in self.t1:
                 block = self.t1.pop(block_hash)
@@ -76,9 +86,11 @@ class ARCCachePolicy(CachePolicy):
                     self.t1[block_hash] = block
                 else:
                     self.t2[block_hash] = block
+                count += 1
 
             elif block_hash in self.t2:
                 self.t2.move_to_end(block_hash)
+                count += 1
 
             elif block_hash in self.b1:
                 delta = max(1, len(self.b2) / len(self.b1))
@@ -93,18 +105,22 @@ class ARCCachePolicy(CachePolicy):
                 self.target_t1_size = max(self.target_t1_size - delta, 0)
                 # move to MRU position (end) to keep it fresh in the ghost list
                 self.b2.move_to_end(block_hash)
+        self.stats.touch_blocks += count
 
     def evict(
         self, n: int, protected: set[BlockHash]
     ) -> list[tuple[BlockHash, BlockStatus]] | None:
+        self.stats.evict_calls += 1
+        self.stats.cache_size_at_last_evict = len(self.t1) + len(self.t2)
+
         if n == 0:
             return []
 
         # Collect candidates atomically: simulate T1 size changes as we select,
         # but do not modify actual data structures until all n are found.
-        candidates: list[
-            tuple[BlockHash, BlockStatus, bool]
-        ] = []  # (hash, block, from_t1)
+        candidates: list[tuple[BlockHash, BlockStatus, bool]] = (
+            []
+        )  # (hash, block, from_t1)
         already_selected: set[BlockHash] = set()
         virtual_t1_size = len(self.t1)
 
@@ -132,6 +148,7 @@ class ARCCachePolicy(CachePolicy):
                         candidate = (block_hash, block, False)
                         break
                 if candidate is None:
+                    self.stats.evict_failed += 1
                     return None
 
             candidates.append(candidate)
@@ -153,4 +170,5 @@ class ARCCachePolicy(CachePolicy):
             for _ in range(len(ghost) - self.cache_capacity):
                 ghost.popitem(last=False)
 
+        self.stats.evict_blocks += len(result)
         return result

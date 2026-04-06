@@ -3,6 +3,7 @@
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from vllm import envs
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -20,6 +21,8 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    S3FIFOFreeBlockQueue,
+    SIEVEFreeBlockQueue,
     generate_block_hash_extra_keys,
     get_block_hash,
     make_block_hash_with_group_id,
@@ -161,10 +164,17 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        gpu_policy = (envs.VLLM_KV_OFFLOAD_POLICY or "").lower()
+        if gpu_policy == "s3fifo":
+            self.free_block_queue: (
+                FreeKVCacheBlockQueue | S3FIFOFreeBlockQueue | SIEVEFreeBlockQueue
+            ) = S3FIFOFreeBlockQueue(self.blocks)
+        elif gpu_policy == "sieve":
+            self.free_block_queue = SIEVEFreeBlockQueue(self.blocks)
+        else:
+            gpu_policy = "lru"
+            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        logger.info("GPU KV cache eviction policy: %s", gpu_policy)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -306,13 +316,15 @@ class BlockPool:
                     parent_block_hash=parent_block_hash,
                     token_ids=request.all_token_ids[start_token_idx:end_token_idx],
                     block_size=block_size,
-                    lora_id=request.lora_request.adapter_id
-                    if request.lora_request
-                    else None,
+                    lora_id=(
+                        request.lora_request.adapter_id
+                        if request.lora_request
+                        else None
+                    ),
                     medium=MEDIUM_GPU,
-                    lora_name=request.lora_request.name
-                    if request.lora_request
-                    else None,
+                    lora_name=(
+                        request.lora_request.name if request.lora_request else None
+                    ),
                     extra_keys=extra_keys_list if extra_keys_list else None,
                 )
             )

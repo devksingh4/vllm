@@ -78,7 +78,7 @@ def verify_events(
     assert tuple(stores) == to_hash_sets(expected_stores)
 
 
-@pytest.mark.parametrize("eviction_policy", ["lru", "arc"])
+@pytest.mark.parametrize("eviction_policy", ["lru", "arc", "sieve"])
 def test_already_stored_block_not_evicted_during_prepare_store(eviction_policy):
     """
     Regression test: a block that is already stored must not be evicted
@@ -622,3 +622,219 @@ def test_filter_reused_manager():
     assert prepare_store_output.block_hashes_to_store == []
 
     manager.complete_store(to_hashes([1]))
+
+
+def test_sieve_manager_basic():
+    """
+    Tests CPUOffloadingManager with sieve policy.
+    Basic store, lookup, and eviction flow.
+    """
+    block_size = 256
+    manager = CPUOffloadingManager(
+        block_size=block_size,
+        num_blocks=4,
+        cache_policy="sieve",
+        enable_events=True,
+    )
+
+    # store [1, 2]
+    prepare_store_output = manager.prepare_store(to_hashes([1, 2]))
+    verify_store_output(
+        prepare_store_output,
+        ExpectedPrepareStoreOutput(
+            block_hashes_to_store=[1, 2],
+            store_block_ids=[0, 1],
+            block_hashes_evicted=[],
+        ),
+    )
+
+    # not ready yet
+    assert manager.lookup(to_hashes([1, 2])) == 0
+
+    # complete
+    manager.complete_store(to_hashes([1, 2]))
+    verify_events(
+        manager.take_events(), block_size=block_size, expected_stores=({1, 2},)
+    )
+
+    # lookup
+    assert manager.lookup(to_hashes([1])) == 1
+    assert manager.lookup(to_hashes([1, 2])) == 2
+    assert manager.lookup(to_hashes([1, 2, 3])) == 2
+
+
+def test_sieve_one_hit_wonder_eviction():
+    """
+    SIEVE should evict "one-hit wonder" entries (never touched after insert)
+    before entries that have been touched (visited=True).
+    """
+    block_size = 256
+    manager = CPUOffloadingManager(
+        block_size=block_size,
+        num_blocks=4,
+        cache_policy="sieve",
+        enable_events=False,
+    )
+
+    # fill cache with [1, 2, 3, 4]
+    manager.prepare_store(to_hashes([1, 2, 3, 4]))
+    manager.complete_store(to_hashes([1, 2, 3, 4]))
+
+    # touch [1, 2] — these get visited=True; 3 and 4 remain unvisited
+    manager.touch(to_hashes([1, 2]))
+
+    # store [5] — must evict one block
+    # SIEVE should skip visited entries and evict an unvisited one
+    output = manager.prepare_store(to_hashes([5]))
+    assert output is not None
+    evicted = set(output.block_hashes_evicted)
+    # The evicted block should be one of the unvisited ones (3 or 4)
+    assert evicted.issubset(set(to_hashes([3, 4])))
+
+
+def test_sieve_visited_bit_cleared_during_scan():
+    """
+    When the hand passes a visited entry during eviction it clears the
+    visited bit.  A subsequent eviction should then be able to evict that
+    entry.
+    """
+    block_size = 256
+    manager = CPUOffloadingManager(
+        block_size=block_size,
+        num_blocks=3,
+        cache_policy="sieve",
+        enable_events=False,
+    )
+
+    # fill cache with [1, 2, 3]
+    manager.prepare_store(to_hashes([1, 2, 3]))
+    manager.complete_store(to_hashes([1, 2, 3]))
+
+    # touch all — every entry now has visited=True
+    manager.touch(to_hashes([1, 2, 3]))
+
+    # first eviction: hand must clear visited bits, then wrap and evict
+    output = manager.prepare_store(to_hashes([4]))
+    assert output is not None
+    first_evicted = output.block_hashes_evicted[0]
+    manager.complete_store(to_hashes([4]))
+
+    # second eviction: the remaining entries had their visited bits cleared
+    # during the first scan, so the hand should now evict without needing
+    # to clear again
+    output = manager.prepare_store(to_hashes([5]))
+    assert output is not None
+    second_evicted = output.block_hashes_evicted[0]
+
+    # two different blocks should have been evicted
+    assert first_evicted != second_evicted
+
+
+def test_sieve_eviction_skips_in_flight():
+    """
+    Blocks with ref_cnt > 0 (being loaded) must not be evicted.
+    """
+    block_size = 256
+    manager = CPUOffloadingManager(
+        block_size=block_size,
+        num_blocks=4,
+        cache_policy="sieve",
+        enable_events=False,
+    )
+
+    manager.prepare_store(to_hashes([1, 2, 3, 4]))
+    manager.complete_store(to_hashes([1, 2, 3, 4]))
+
+    # start loading [1, 2] — increases ref_cnt
+    manager.prepare_load(to_hashes([1, 2]))
+
+    # evicting 3 blocks should fail because only 2 are eligible
+    assert manager.prepare_store(to_hashes([5, 6, 7])) is None
+
+    # complete load
+    manager.complete_load(to_hashes([1, 2]))
+
+    # now evicting 3 should succeed
+    output = manager.prepare_store(to_hashes([5, 6, 7]))
+    assert output is not None
+    assert len(output.block_hashes_evicted) >= 1
+
+
+def test_sieve_failed_store_cleanup():
+    """
+    A failed complete_store must clean up the block without leaving stale
+    entries.
+    """
+    block_size = 256
+    manager = CPUOffloadingManager(
+        block_size=block_size,
+        num_blocks=4,
+        cache_policy="sieve",
+        enable_events=False,
+    )
+
+    manager.prepare_store(to_hashes([1, 2, 3, 4]))
+    manager.complete_store(to_hashes([1, 2, 3, 4]))
+
+    # prepare store [5] — evicts one block
+    output = manager.prepare_store(to_hashes([5]))
+    assert output is not None
+
+    # fail the store
+    manager.complete_store(to_hashes([5]), success=False)
+
+    # block 5 should not be in cache
+    assert manager.lookup(to_hashes([5])) == 0
+
+
+def test_sieve_full_scenario():
+    """
+    End-to-end scenario covering store, touch, eviction, load, and failure.
+    """
+    block_size = 256
+    manager = CPUOffloadingManager(
+        block_size=block_size,
+        num_blocks=4,
+        cache_policy="sieve",
+        enable_events=True,
+    )
+
+    # store [1, 2]
+    manager.prepare_store(to_hashes([1, 2]))
+    manager.complete_store(to_hashes([1, 2]))
+
+    # store [2, 3, 4, 5] — block 2 already stored, need 3 new slots,
+    # must evict 1 block
+    output = manager.prepare_store(to_hashes([2, 3, 4, 5]))
+    assert output is not None
+    assert len(output.block_hashes_to_store) == 3  # [3, 4, 5]
+    assert len(output.block_hashes_evicted) == 1
+    manager.complete_store(to_hashes([2, 3, 4, 5]))
+
+    # touch [2, 3] so they get visited=True
+    manager.touch(to_hashes([2, 3]))
+
+    # start loading [2, 3] — ref_cnt > 0, not evictable
+    manager.prepare_load(to_hashes([2, 3]))
+
+    # need 3 slots but only 2 blocks are evictable (4 and 5)
+    assert manager.prepare_store(to_hashes([6, 7, 8])) is None
+
+    # complete load
+    manager.complete_load(to_hashes([2, 3]))
+
+    # store [6] — should evict an unvisited block (4 or 5), not
+    # the visited blocks 2 or 3
+    output = manager.prepare_store(to_hashes([6]))
+    assert output is not None
+    evicted = set(output.block_hashes_evicted)
+    assert evicted.issubset(set(to_hashes([4, 5])))
+    manager.complete_store(to_hashes([6]))
+
+    # blocks 2, 3 (touched) should still be present
+    assert manager.lookup(to_hashes([2])) == 1
+    assert manager.lookup(to_hashes([3])) == 1
+
+    # verify we got events
+    events = list(manager.take_events())
+    assert len(events) > 0
