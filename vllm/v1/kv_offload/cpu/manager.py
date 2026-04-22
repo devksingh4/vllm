@@ -15,14 +15,25 @@ from vllm.logger import init_logger
 from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lora_aware import (
+    LoRAAdaptiveBudgetPolicy,
+    LoRABudgetPolicy,
+    LoRACorrelatedTouchPolicy,
+    LoRACostAwarePolicy,
+    LoRAFrequencyWeightedPolicy,
+    LoRAGhostListPolicy,
     LoRAHysteresisCouplingPolicy,
     LoRALooseCouplingPolicy,
+    LoRAPositionAwarePolicy,
+    LoRAPrefixTreePolicy,
     LoRASoftBoostCouplingPolicy,
     LoRATightCouplingPolicy,
+    LoRATwoLevelLRUPolicy,
 )
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.kv_offload.cpu.policies.lru_k import LRUKCachePolicy
 from vllm.v1.kv_offload.cpu.policies.s3fifo import S3FIFOCachePolicy
 from vllm.v1.kv_offload.cpu.policies.sieve import SIEVECachePolicy
+from vllm.v1.kv_offload.cpu.policies.tinylfu import TinyLFUCachePolicy
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 
 logger = init_logger(__name__)
@@ -32,6 +43,10 @@ _BASE_POLICIES: dict[str, type[CachePolicy]] = {
     "arc": ARCCachePolicy,
     "sieve": SIEVECachePolicy,
     "s3fifo": S3FIFOCachePolicy,
+    "tinylfu": TinyLFUCachePolicy,
+    "lru_k": LRUKCachePolicy,
+    # Standalone LoRA-aware (not a decorator)
+    "lora_twolevel": LoRATwoLevelLRUPolicy,
 }
 
 _LORA_COUPLING_MODES: dict[str, type] = {
@@ -39,6 +54,14 @@ _LORA_COUPLING_MODES: dict[str, type] = {
     "lora_loose": LoRALooseCouplingPolicy,
     "lora_hysteresis": LoRAHysteresisCouplingPolicy,
     "lora_soft": LoRASoftBoostCouplingPolicy,
+    "lora_freqweighted": LoRAFrequencyWeightedPolicy,
+    "lora_correlated": LoRACorrelatedTouchPolicy,
+    "lora_budget": LoRABudgetPolicy,
+    "lora_adabudget": LoRAAdaptiveBudgetPolicy,
+    "lora_costaware": LoRACostAwarePolicy,
+    "lora_ghost": LoRAGhostListPolicy,
+    "lora_position": LoRAPositionAwarePolicy,
+    "lora_prefixtree": LoRAPrefixTreePolicy,
 }
 
 # Flat registry: base policies + all lora coupling combinations

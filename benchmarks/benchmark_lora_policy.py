@@ -45,14 +45,25 @@ from dataclasses import dataclass
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.lora_aware import (
+    LoRAAdaptiveBudgetPolicy,
+    LoRABudgetPolicy,
+    LoRACorrelatedTouchPolicy,
+    LoRACostAwarePolicy,
+    LoRAFrequencyWeightedPolicy,
+    LoRAGhostListPolicy,
     LoRAHysteresisCouplingPolicy,
     LoRALooseCouplingPolicy,
+    LoRAPositionAwarePolicy,
+    LoRAPrefixTreePolicy,
     LoRASoftBoostCouplingPolicy,
     LoRATightCouplingPolicy,
+    LoRATwoLevelLRUPolicy,
 )
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.kv_offload.cpu.policies.lru_k import LRUKCachePolicy
 from vllm.v1.kv_offload.cpu.policies.s3fifo import S3FIFOCachePolicy
 from vllm.v1.kv_offload.cpu.policies.sieve import SIEVECachePolicy
+from vllm.v1.kv_offload.cpu.policies.tinylfu import TinyLFUCachePolicy
 
 
 # ---------------------------------------------------------------------------
@@ -244,12 +255,23 @@ def _make_policy(
         "lru": LRUCachePolicy,
         "sieve": SIEVECachePolicy,
         "s3fifo": S3FIFOCachePolicy,
+        "tinylfu": TinyLFUCachePolicy,
+        "lru_k": LRUKCachePolicy,
+        "lora_twolevel": LoRATwoLevelLRUPolicy,
     }
     coupling_map: dict[str, type] = {
         "lora_tight": LoRATightCouplingPolicy,
         "lora_loose": LoRALooseCouplingPolicy,
         "lora_hysteresis": LoRAHysteresisCouplingPolicy,
         "lora_soft": LoRASoftBoostCouplingPolicy,
+        "lora_freqweighted": LoRAFrequencyWeightedPolicy,
+        "lora_correlated": LoRACorrelatedTouchPolicy,
+        "lora_budget": LoRABudgetPolicy,
+        "lora_adabudget": LoRAAdaptiveBudgetPolicy,
+        "lora_costaware": LoRACostAwarePolicy,
+        "lora_ghost": LoRAGhostListPolicy,
+        "lora_position": LoRAPositionAwarePolicy,
+        "lora_prefixtree": LoRAPrefixTreePolicy,
     }
     if ":" in name:
         coupling_name, base_name = name.split(":", 1)
@@ -269,6 +291,8 @@ def simulate(
     """Run one simulation: feed requests through the policy and collect stats."""
     policy, _ = _make_policy(policy_name, cache_capacity)
     is_lora_aware = hasattr(policy, "register_block_adapter")
+    has_position = hasattr(policy, "register_block_position")
+    has_parent = hasattr(policy, "register_block_parent")
 
     result = SimResult(policy_name=policy_name, scenario=scenario_name)
 
@@ -334,6 +358,14 @@ def simulate(
                 cache_size += 1
                 if is_lora_aware:
                     policy.register_block_adapter(bh, adapter_id)
+                if has_position:
+                    policy.register_block_position(
+                        bh, req.block_hashes.index(bh)
+                    )
+                if has_parent:
+                    idx = req.block_hashes.index(bh)
+                    parent = req.block_hashes[idx - 1] if idx > 0 else None
+                    policy.register_block_parent(bh, parent)
 
     return result
 
@@ -381,19 +413,49 @@ def parse_args() -> argparse.Namespace:
 
 
 _ALL_POLICIES = [
+    # --- baselines ---
     "lru",
     "sieve",
     "s3fifo",
-    "lora_tight:lru",
+    # --- new classical baselines ---
+    "tinylfu",
+    "lru_k",
+    # --- original coupling strategies ---
     "lora_tight:s3fifo",
-    "lora_loose:lru",
+    "lora_tight:sieve",
     "lora_loose:s3fifo",
-    "lora_hysteresis:lru",
-    "lora_hysteresis:sieve",
+    "lora_loose:sieve",
     "lora_hysteresis:s3fifo",
-    "lora_soft:lru",
-    "lora_soft:sieve",
+    "lora_hysteresis:sieve",
     "lora_soft:s3fifo",
+    "lora_soft:sieve",
+    # --- refined continuous-signal strategies ---
+    "lora_freqweighted:lru",
+    "lora_freqweighted:s3fifo",
+    "lora_freqweighted:sieve",
+    "lora_correlated:lru",
+    "lora_correlated:sieve",
+    "lora_correlated:s3fifo",
+    "lora_budget:lru",
+    "lora_budget:s3fifo",
+    "lora_budget:sieve",
+    "lora_budget:tinylfu",
+    "lora_adabudget:lru",
+    "lora_adabudget:s3fifo",
+    "lora_adabudget:tinylfu",
+    "lora_costaware:lru",
+    "lora_costaware:s3fifo",
+    "lora_costaware:sieve",
+    "lora_ghost:lru",
+    "lora_ghost:s3fifo",
+    "lora_ghost:sieve",
+    # --- structural (vllm-specific) ---
+    "lora_position:lru",
+    "lora_position:s3fifo",
+    "lora_prefixtree:lru",
+    "lora_prefixtree:s3fifo",
+    # --- standalone policy ---
+    "lora_twolevel",
 ]
 
 
