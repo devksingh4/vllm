@@ -3,7 +3,6 @@
 import atexit
 import os
 from collections.abc import Iterable
-from typing import Literal, cast
 
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
@@ -15,6 +14,12 @@ from vllm.v1.kv_offload.abstract import (
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+from vllm.v1.kv_offload.cpu.policies.lora_aware import (
+    LoRAHysteresisCouplingPolicy,
+    LoRALooseCouplingPolicy,
+    LoRASoftBoostCouplingPolicy,
+    LoRATightCouplingPolicy,
+)
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 from vllm.v1.kv_offload.cpu.policies.s3fifo import S3FIFOCachePolicy
 from vllm.v1.kv_offload.cpu.policies.sieve import SIEVECachePolicy
@@ -22,12 +27,61 @@ from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 
 logger = init_logger(__name__)
 
-_CACHE_POLICIES: dict[str, type[CachePolicy]] = {
+_BASE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
     "sieve": SIEVECachePolicy,
     "s3fifo": S3FIFOCachePolicy,
 }
+
+_LORA_COUPLING_MODES: dict[str, type] = {
+    "lora_tight": LoRATightCouplingPolicy,
+    "lora_loose": LoRALooseCouplingPolicy,
+    "lora_hysteresis": LoRAHysteresisCouplingPolicy,
+    "lora_soft": LoRASoftBoostCouplingPolicy,
+}
+
+# Flat registry: base policies + all lora coupling combinations
+_CACHE_POLICIES: dict[str, type[CachePolicy]] = dict(_BASE_POLICIES)
+
+
+def _build_policy(
+    name: str, capacity: int
+) -> tuple[CachePolicy, str]:
+    """Build a CachePolicy from a policy name string.
+
+    Supports plain names like ``"lru"`` as well as LoRA-coupled names
+    like ``"lora_tight:sieve"`` (tight coupling wrapping SIEVE).
+    """
+    # Check for lora coupling syntax: "lora_tight:base" or "lora_loose:base"
+    if ":" in name:
+        coupling_name, base_name = name.split(":", 1)
+        coupling_cls = _LORA_COUPLING_MODES.get(coupling_name)
+        base_cls = _BASE_POLICIES.get(base_name)
+        if coupling_cls is None:
+            raise ValueError(
+                f"Unknown LoRA coupling mode: {coupling_name!r}. "
+                f"Supported: {list(_LORA_COUPLING_MODES)}"
+            )
+        if base_cls is None:
+            raise ValueError(
+                f"Unknown base cache policy: {base_name!r}. "
+                f"Supported: {list(_BASE_POLICIES)}"
+            )
+        return coupling_cls(cache_capacity=capacity, inner_cls=base_cls), name
+
+    # Plain base policy
+    policy_cls = _CACHE_POLICIES.get(name)
+    if policy_cls is None:
+        all_names = list(_CACHE_POLICIES) + [
+            f"{c}:{b}"
+            for c in _LORA_COUPLING_MODES
+            for b in _BASE_POLICIES
+        ]
+        raise ValueError(
+            f"Unknown cache policy: {name!r}. Supported: {all_names}"
+        )
+    return policy_cls(cache_capacity=capacity), name
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -44,7 +98,7 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         block_size: int,
         num_blocks: int,
-        cache_policy: Literal["lru", "arc", "sieve", "s3fifo", None] = None,
+        cache_policy: str | None = None,
         enable_events: bool = False,
     ):
         self.block_size: int = block_size
@@ -54,15 +108,10 @@ class CPUOffloadingManager(OffloadingManager):
         self._free_list: list[int] = []
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
         if (raw_val := os.getenv("VLLM_KV_OFFLOAD_POLICY")) and raw_val:
-            cache_policy = cast(Literal["lru", "arc", "sieve"], raw_val.lower())
-        policy_cls = _CACHE_POLICIES.get(cache_policy or "")
-        if policy_cls is None:
-            raise ValueError(
-                f"Unknown cache policy: {cache_policy!r}. "
-                f"Supported: {list(_CACHE_POLICIES)}"
-            )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
-        self._policy_name = cache_policy or "unknown"
+            cache_policy = raw_val.lower()
+        self._policy, self._policy_name = _build_policy(
+            cache_policy or "", num_blocks
+        )
 
         atexit.register(self._log_policy_stats)
 
@@ -108,6 +157,28 @@ class CPUOffloadingManager(OffloadingManager):
             s.lookup_hit_blocks,
             s.lookup_total_blocks,
         )
+
+    # --- LoRA adapter awareness ---
+
+    def register_block_adapters(
+        self, mapping: dict[BlockHash, str | None]
+    ) -> None:
+        """Register adapter IDs for recently inserted block hashes.
+
+        Only effective when the active policy is LoRA-aware (tight or loose
+        coupling).  Silently ignored for plain policies.
+        """
+        if hasattr(self._policy, "register_block_adapter"):
+            for block_hash, adapter_id in mapping.items():
+                self._policy.register_block_adapter(block_hash, adapter_id)
+
+    def update_live_adapters(self, adapters: set[str]) -> None:
+        """Update the set of LoRA adapters currently resident on GPU.
+
+        Only effective when the active policy is LoRA-aware.
+        """
+        if hasattr(self._policy, "update_live_adapters"):
+            self._policy.update_live_adapters(adapters)
 
     # --- block pool ---
 
