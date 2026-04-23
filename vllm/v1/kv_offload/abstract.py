@@ -161,3 +161,21 @@ class OffloadingManager(ABC):
             New OffloadingEvents collected since the last call.
         """
         return ()
+
+    def register_block_adapters(
+        self, mapping: "dict[BlockHash, str | None]"
+    ) -> None:
+        """
+        Associate block hashes with the LoRA adapter that produced them.
+        Policies that key eviction decisions on adapter identity consume this;
+        the default is a no-op.
+        """
+        return
+
+    def update_live_adapters(self, adapters: "set[str]") -> None:
+        """
+        Announce the set of LoRA adapters currently resident on GPU.
+        Adapter-aware policies use this to weight eviction toward blocks
+        whose adapter has left GPU. The default is a no-op.
+        """
+        return

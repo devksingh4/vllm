@@ -235,6 +235,15 @@ class OffloadingConnectorScheduler:
                 continue
             block_hashes_to_store = set(store_output.block_hashes_to_store)
 
+            # Hand the adapter identity of each newly stored block to
+            # adapter-aware eviction policies. Plain policies ignore this.
+            adapter_name = (
+                req.lora_request.lora_name if req.lora_request is not None else None
+            )
+            self.manager.register_block_adapters(
+                {bh: adapter_name for bh in store_output.block_hashes_to_store}
+            )
+
             block_hashes = self._get_block_hashes(req, end_idx=num_blocks)
             self.manager.touch(block_hashes)
 
@@ -269,6 +278,17 @@ class OffloadingConnectorScheduler:
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        # Refresh the adapter-aware policies' view of which LoRAs are "live"
+        # before evicting. A LoRA with an in-flight request is assumed to be
+        # on (or about to be brought to) GPU; any LoRA that has left this set
+        # is a candidate for eviction preference.
+        live_adapters: set[str] = {
+            req.lora_request.lora_name
+            for req in self._requests.values()
+            if req.lora_request is not None
+        }
+        self.manager.update_live_adapters(live_adapters)
+
         meta = OffloadingConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_store=self._get_reqs_to_store(scheduler_output),
