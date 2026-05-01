@@ -99,6 +99,7 @@ def make_request(
         cache_salt=cache_salt,
         block_hasher=get_request_block_hasher(block_size, hash_fn),
         prompt_embeds=prompt_embeds,
+        cache_partition_id="test-partition",
     )
 
 

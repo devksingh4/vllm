@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -190,6 +191,45 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
+        # Per-block ref attribution for partition metrics (ref_cnt contributions).
+        self._block_partition_refs: dict[int, dict[str, int]] = {}
+        self._partition_block_ref_totals: defaultdict[str, int] = defaultdict(int)
+
+    def get_partition_block_ref_totals(self) -> dict[str, int]:
+        """Snapshot of ref_cnt contributions attributed to each cache partition."""
+        return dict(self._partition_block_ref_totals)
+
+    def _partition_note_ref(
+        self, block: KVCacheBlock, cache_partition_id: str, delta: int
+    ) -> None:
+        if block.is_null:
+            return
+        bid = block.block_id
+        if delta == 1:
+            per_block = self._block_partition_refs.setdefault(bid, {})
+            per_block[cache_partition_id] = per_block.get(cache_partition_id, 0) + 1
+            self._partition_block_ref_totals[cache_partition_id] += 1
+        elif delta == -1:
+            # Tests (and some edge paths) may free blocks that were never
+            # allocated through this pool with partition tracking; skip metrics
+            # adjustment when there is no matching recorded ref.
+            per_block = self._block_partition_refs.get(bid)
+            if per_block is None:
+                return
+            prev = per_block.get(cache_partition_id, 0)
+            if prev <= 0:
+                return
+            per_block[cache_partition_id] = prev - 1
+            self._partition_block_ref_totals[cache_partition_id] -= 1
+            if per_block[cache_partition_id] == 0:
+                del per_block[cache_partition_id]
+            if not per_block:
+                del self._block_partition_refs[bid]
+            if self._partition_block_ref_totals[cache_partition_id] == 0:
+                del self._partition_block_ref_totals[cache_partition_id]
+        else:
+            raise ValueError(f"delta must be ±1, got {delta}")
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -329,7 +369,9 @@ class BlockPool:
                 )
             )
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(
+        self, num_blocks: int, cache_partition_id: str
+    ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
@@ -351,12 +393,14 @@ class BlockPool:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                self._partition_note_ref(block, cache_partition_id, 1)
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                self._partition_note_ref(block, cache_partition_id, 1)
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
@@ -401,13 +445,15 @@ class BlockPool:
             )
         return True
 
-    def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+    def touch(self, blocks: Sequence[KVCacheBlock], cache_partition_id: str) -> None:
         """Touch a block increases its reference count by 1, and may remove
         the block from the free queue. This is used when a block is hit by
         another request with the same prefix.
 
         Args:
             blocks: A list of blocks to touch.
+            cache_partition_id: Logical partition owning this ref increment
+                (for metrics only).
         """
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
@@ -415,21 +461,30 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            self._partition_note_ref(block, cache_partition_id, 1)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(
+        self,
+        ordered_blocks: Iterable[KVCacheBlock],
+        cache_partition_id: str,
+    ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            cache_partition_id: Logical partition releasing one ref per block
+                (for metrics only).
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
+            if not block.is_null:
+                self._partition_note_ref(block, cache_partition_id, -1)
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
@@ -480,6 +535,9 @@ class BlockPool:
 
         if self.metrics_collector:
             self.metrics_collector.reset()
+
+        self._block_partition_refs.clear()
+        self._partition_block_ref_totals.clear()
 
         logger.info("Successfully reset prefix cache")
 

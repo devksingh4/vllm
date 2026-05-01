@@ -371,7 +371,9 @@ class KVCacheManager:
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
         self.coordinator.remove_skipped_blocks(
-            request.request_id, total_computed_tokens
+            request.request_id,
+            total_computed_tokens,
+            request.cache_partition_id,
         )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
@@ -399,13 +401,15 @@ class KVCacheManager:
                 new_computed_blocks=new_computed_block_list,
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
+                cache_partition_id=request.cache_partition_id,
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
             num_tokens_main_model,
-            num_encoder_tokens,
+            request.cache_partition_id,
+            num_encoder_tokens=num_encoder_tokens,
         )
 
         # P/D: delay caching blocks if we have to recv from
@@ -434,10 +438,13 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self.coordinator.free(request.request_id)
+        self.coordinator.free(request.request_id, request.cache_partition_id)
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        cache_partition_id: str,
     ) -> None:
         """Remove the blocks that are no longer needed from `blocks` and replace
         the removed blocks with null_block.
@@ -446,8 +453,11 @@ class KVCacheManager:
             request_id: The request ID.
             total_computed_tokens: The total number of computed tokens, including
                 local computed tokens and external computed tokens.
+            cache_partition_id: Logical partition for freed refs (metrics).
         """
-        self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
+        self.coordinator.remove_skipped_blocks(
+            request_id, total_computed_tokens, cache_partition_id
+        )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

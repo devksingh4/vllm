@@ -21,6 +21,7 @@ import zmq
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.config.model import get_served_model_name
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
@@ -734,6 +735,10 @@ class EngineCore:
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
 
+    def default_cache_partition_id(self) -> str:
+        mc = self.vllm_config.model_config
+        return get_served_model_name(mc.model, mc.served_model_name)
+
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
 
@@ -748,7 +753,11 @@ class EngineCore:
                 request.mm_features
             )
 
-        req = Request.from_engine_core_request(request, self.request_block_hasher)
+        req = Request.from_engine_core_request(
+            request,
+            self.request_block_hasher,
+            default_cache_partition_id=self.default_cache_partition_id(),
+        )
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

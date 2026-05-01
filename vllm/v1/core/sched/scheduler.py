@@ -1957,6 +1957,7 @@ class Scheduler(SchedulerInterface):
             num_waiting_reqs=len(self.waiting) + len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
             encoder_cache_usage=self._get_encoder_cache_usage(),
+            kv_cache_partition_block_refs=self.kv_cache_manager.block_pool.get_partition_block_ref_totals(),
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
@@ -2023,6 +2024,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.remove_skipped_blocks(
             request_id=request.request_id,
             total_computed_tokens=request.num_tokens,
+            cache_partition_id=request.cache_partition_id,
         )
 
         block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
