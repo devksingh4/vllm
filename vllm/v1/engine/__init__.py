@@ -101,6 +101,10 @@ class EngineCoreRequest(
 
     reasoning_ended: bool | None = None
 
+    # Logical KV cache partition (e.g. served model / tenant). Resolved in
+    # InputProcessor; may be None for tests or legacy EngineCoreRequest payloads.
+    cache_partition_id: str | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

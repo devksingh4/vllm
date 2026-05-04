@@ -256,6 +256,13 @@ class LoggingStatLogger(StatLoggerBase):
             log_parts.append("MM cache hit rate: %.1f%%")
             log_args.append(self.mm_caching_metrics.hit_rate * 100)
 
+        part_refs = self.last_scheduler_stats.kv_cache_partition_block_refs
+        if part_refs:
+            log_parts.append("KV cache partition block refs: %s")
+            log_args.append(
+                ", ".join(f"{k}={v}" for k, v in sorted(part_refs.items()))
+            )
+
         log_fn(
             self.log_prefix + ", ".join(log_parts),
             *log_args,
@@ -332,6 +339,11 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
                 last_scheduler_stats.kv_cache_usage
             )
         self.last_scheduler_stats.kv_cache_usage /= len(self.last_scheduler_stats_dict)
+        merged_partition_refs: dict[str, int] = {}
+        for s in self.last_scheduler_stats_dict.values():
+            for k, v in s.kv_cache_partition_block_refs.items():
+                merged_partition_refs[k] = merged_partition_refs.get(k, 0) + v
+        self.last_scheduler_stats.kv_cache_partition_block_refs = merged_partition_refs
 
     def log(self):
         LoggingStatLogger.log(self)
@@ -488,6 +500,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.gauge_kv_cache_usage = create_metric_per_engine(
             gauge_kv_cache_usage, per_engine_labelvalues
         )
+
+        gauge_kv_cache_partition_block_refs = self._gauge_cls(
+            name="vllm:kv_cache_partition_block_refs",
+            documentation=(
+                "GPU KV cache blocks attributed to each cache_partition_id "
+                "(request metadata; see SamplingParams.extra_args / pooling extra_kwargs)."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames + ["cache_partition"],
+        )
+        self.gauge_kv_cache_partition_block_refs = gauge_kv_cache_partition_block_refs
+        self._kv_partition_ref_prev_labels: dict[int, set[str]] = {
+            idx: set() for idx in engine_indexes
+        }
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
@@ -1044,6 +1070,25 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+
+            model_name_lv, engine_lv = self.per_engine_labelvalues[engine_idx]
+            refs = scheduler_stats.kv_cache_partition_block_refs
+            prev_labels = self._kv_partition_ref_prev_labels[engine_idx]
+            for pid in prev_labels:
+                if pid not in refs:
+                    self.gauge_kv_cache_partition_block_refs.labels(
+                        model_name=model_name_lv,
+                        engine=engine_lv,
+                        cache_partition=pid,
+                    ).set(0)
+            prev_labels.clear()
+            for pid, count in refs.items():
+                self.gauge_kv_cache_partition_block_refs.labels(
+                    model_name=model_name_lv,
+                    engine=engine_lv,
+                    cache_partition=pid,
+                ).set(count)
+                prev_labels.add(pid)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

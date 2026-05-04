@@ -26,6 +26,20 @@ ShareGPT example usage:
         --num-prompts 20 \
         --repeat-count 5 \
         --input-length-range 128:256
+
+After generation, the script prints wall time and prefix-cache totals from
+Prometheus counters (``vllm:prefix_cache_hits`` / ``vllm:prefix_cache_queries``)
+via ``LLM.get_metrics()``. Requires stat logging (the default when using
+``EngineArgs`` / this script; do not pass ``--disable-log-stats``).
+
+Experimental multi-model KV sharing (JSON dicts; partition ids match
+``cache_partition_id`` on requests), for example:
+
+    python benchmark_prefix_caching.py ... \
+        --kv-cache-partition-ref-caps '{"default": 500}'
+
+    python benchmark_prefix_caching.py ... \
+        --kv-cache-partition-eviction-cost '{"default": 2.0}'
 """
 
 import dataclasses
@@ -38,6 +52,7 @@ from transformers import PreTrainedTokenizerBase
 from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.metrics.reader import Counter
 
 try:
     from vllm.tokenizers import get_tokenizer
@@ -54,6 +69,37 @@ def test_prefix(llm=None, sampling_params=None, prompts=None):
 
     end_time = time.time()
     print(f"cost time {end_time - start_time}")
+
+
+def print_prefix_cache_metrics(llm: LLM) -> None:
+    """Sum engine counters and print token-level prefix cache hit rate."""
+    try:
+        metrics = llm.get_metrics()
+    except AssertionError:
+        print(
+            "Prefix cache metrics skipped: stat logging is disabled "
+            "(pass disable_log_stats=False or omit --disable-log-stats)."
+        )
+        return
+
+    total_hits = 0
+    total_queries = 0
+    for m in metrics:
+        if not isinstance(m, Counter):
+            continue
+        if m.name == "vllm:prefix_cache_hits":
+            total_hits += m.value
+        elif m.name == "vllm:prefix_cache_queries":
+            total_queries += m.value
+
+    print(
+        f"prefix_cache_queries={total_queries} prefix_cache_hits={total_hits}",
+        end="",
+    )
+    if total_queries > 0:
+        print(f" hit_rate={total_hits / total_queries:.4f}")
+    else:
+        print(" hit_rate=n/a (no queries recorded)")
 
 
 @dataclasses.dataclass
@@ -215,6 +261,7 @@ def main(args):
         prompts=prompts,
         sampling_params=sampling_params,
     )
+    print_prefix_cache_metrics(llm)
 
 
 def create_argument_parser():

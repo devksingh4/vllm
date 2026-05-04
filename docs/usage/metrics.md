@@ -37,6 +37,8 @@ The following metrics are exposed:
 
 --8<-- "docs/generated/metrics/general.inc.md"
 
+`cache_partition_id` is set per request via `SamplingParams.extra_args` / pooling `extra_kwargs` (default: served model name). With stats logging enabled, the engine log line includes `KV cache partition block refs: ...` when any partition has in-flight block refs (same data as the Prometheus gauge in the table above).
+
 ## Speculative Decoding Metrics
 
 --8<-- "docs/generated/metrics/spec_decode.inc.md"
