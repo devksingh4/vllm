@@ -127,6 +127,88 @@ Key features relevant to our work (from `docs/benchmarking/cli.md`):
 - **LoRA benchmarking:** `--lora-modules` with `--lora-assignment
   random|round-robin` — relevant if we pursue multi-LoRA cache coupling.
 
+### Multi-model KV cache partitioning (cache-partition branch)
+
+The `cache-partition` merge adds experimental support for **multi-model
+(multi-tenant) KV cache sharing** on a single GPU block pool. This is
+orthogonal to the base eviction policy (LRU/SIEVE/S3-FIFO) — it layers
+*partition-awareness* on top.
+
+**Core concept:** Each request carries a `cache_partition_id` (set via
+`SamplingParams.extra_args["cache_partition_id"]` or auto-resolved from
+the served model name). The `BlockPool` tracks per-partition ref-count
+contributions and exposes two new sharing policies:
+
+#### 1. Two-level quota (`--kv-cache-partition-ref-caps`)
+
+Hard caps on how many block refs each partition can hold. Prevents one
+model/tenant from monopolising the cache.
+
+```bash
+vllm serve model_a model_b \
+    --kv-cache-partition-ref-caps '{"model_a": 500, "model_b": 300}'
+```
+
+- `BlockPool.get_new_blocks()` raises `ValueError` if a partition
+  would exceed its cap.
+- Caps are **dynamically adjustable** at runtime via
+  `set_partition_ref_caps()` — no engine restart needed.
+- Implementation: `_partition_note_ref()` / `_partition_block_ref_totals`
+  in `vllm/v1/core/block_pool.py`.
+
+#### 2. Cost-aware eviction (`--kv-cache-partition-eviction-cost`)
+
+Single-level GreedyDual-style victim selection. Each partition gets a
+relative "prefill cost" multiplier. When evicting, the pool scans a
+window of free blocks and picks `argmax((now - last_access) / cost)` —
+i.e., stale blocks from cheap-to-recompute partitions are evicted first.
+
+```bash
+vllm serve expensive_model cheap_model \
+    --kv-cache-partition-eviction-cost '{"expensive_model": 10.0, "cheap_model": 1.0}'
+```
+
+- Only composes with the **LRU base policy** (not SIEVE/S3-FIFO).
+  The free block queue becomes `CostAwareFreeKVCacheBlockQueue`.
+- Scan window default: 32 blocks. `popleft()` does a linear scan
+  of `min(scan_window, num_free)` blocks.
+- Implementation: `CostAwareFreeKVCacheBlockQueue` in
+  `vllm/v1/core/kv_cache_utils.py`.
+
+#### Plumbing changes
+
+- `BlockPool.get_new_blocks(n, cache_partition_id)` — partition ID
+  is now a required arg. Same for `touch()` and `free_blocks()`.
+- `KVCacheBlock` gained `kv_eviction_tag` (last partition) and
+  `kv_access_seq` (logical clock) fields for the cost-aware policy.
+- `Request` carries `cache_partition_id` resolved by `InputProcessor`.
+- **Metrics:** New Prometheus gauge `vllm:kv_cache_partition_block_refs`
+  (per-partition ref counts). Also logged in the stat logger.
+- `benchmark_block_pool.py` updated: `get_new_blocks` / `free_blocks`
+  now require a partition ID string (`"__bench__"`).
+- `benchmark_prefix_caching.py` updated: prints Prometheus-based
+  prefix cache hit rate after generation; docstring shows the new
+  `--kv-cache-partition-ref-caps` / `--kv-cache-partition-eviction-cost`
+  CLI flags.
+
+#### Implications for our evaluation
+
+1. **New policy dimension:** We now have 5 policies to compare, not 3:
+   LRU, SIEVE, S3-FIFO, LRU+quota, LRU+cost-aware. The budget sweep
+   should cover the new ones.
+
+2. **Multi-partition workloads needed:** The existing synthetic workloads
+   all use a single implicit partition. We need workloads where multiple
+   "models" or "tenants" compete for the same cache pool, with different
+   access frequencies and prefix sizes.
+
+3. **Fairness metrics:** Beyond TTFT and throughput, we should measure
+   per-partition hit rate and per-partition TTFT to show that quota/cost
+   policies improve fairness vs. unpartitioned LRU.
+
+4. **Quota reapportionment:** Test dynamic `set_partition_ref_caps()`
+   under load — does changing caps mid-flight cause latency spikes?
+
 ### Agentic workload evaluation
 
 Agent workloads are an emerging and highly relevant evaluation dimension for
@@ -223,6 +305,12 @@ agentic workloads where tool calls create pauses that break cache retention.
    cache pressure (growing context, interleaved pauses, mix of stable and
    volatile content). See agentic workload section above.
 
+8. **No multi-partition / multi-tenant workloads** — The new two-level
+   quota and cost-aware eviction policies from `cache-partition` need
+   workloads where ≥2 partitions with different access patterns and
+   prefill costs compete for the same block pool. Existing benchmarks
+   use a single implicit partition.
+
 ## New benchmarks to implement
 
 ### 1. `benchmark_kv_cache_budget_sweep.py` ✅ IMPLEMENTED
@@ -304,15 +392,78 @@ Extend `benchmark_block_pool.py` to sweep `VLLM_KV_OFFLOAD_POLICY` across
 LRU/SIEVE/S3-FIFO and report alloc/free latency. This isolates policy
 bookkeeping overhead from end-to-end effects.
 
+### 6. Multi-partition fairness benchmark ✅ IMPLEMENTED
+
+`benchmark_kv_cache.py --workload multi-partition` with asymmetric
+per-partition configs via `--partition-config` (JSON).
+
+Each partition gets its own prefix pool, request count, and prefix size.
+Requests are interleaved across partitions and batched together, with
+per-request `cache_partition_id` injected into `SamplingParams.extra_args`.
+Results include **per-partition TTFT breakdown**.
+
+**Ref-cap isolation experiment:**
+```bash
+# Baseline: plain LRU, hog monopolises cache
+VLLM_KV_OFFLOAD_POLICY=lru python benchmarks/benchmark_kv_cache.py \
+    --model $MODEL --enable-prefix-caching --enforce-eager \
+    --workload multi-partition \
+    --partition-config '{"hog": {"num_requests": 64, "prefix_words": 200},
+                         "starved": {"num_requests": 16, "prefix_words": 2000}}'
+
+# With quota: cap hog to 300 block refs
+VLLM_KV_OFFLOAD_POLICY=lru python benchmarks/benchmark_kv_cache.py \
+    --model $MODEL --enable-prefix-caching --enforce-eager \
+    --workload multi-partition \
+    --partition-config '{"hog": {"num_requests": 64, "prefix_words": 200},
+                         "starved": {"num_requests": 16, "prefix_words": 2000}}' \
+    --kv-cache-partition-ref-caps '{"hog": 300}'
+```
+
+**Cost-aware eviction experiment:**
+```bash
+# Baseline: plain LRU, expensive and cheap blocks treated equally
+VLLM_KV_OFFLOAD_POLICY=lru python benchmarks/benchmark_kv_cache.py \
+    --model $MODEL --enable-prefix-caching --enforce-eager \
+    --workload multi-partition \
+    --partition-config '{"cheap": {"num_requests": 64, "prefix_words": 200},
+                         "expensive": {"num_requests": 16, "prefix_words": 2000}}'
+
+# With cost-aware: protect expensive partition's blocks
+VLLM_KV_OFFLOAD_POLICY=lru python benchmarks/benchmark_kv_cache.py \
+    --model $MODEL --enable-prefix-caching --enforce-eager \
+    --workload multi-partition \
+    --partition-config '{"cheap": {"num_requests": 64, "prefix_words": 200},
+                         "expensive": {"num_requests": 16, "prefix_words": 2000}}' \
+    --kv-cache-partition-eviction-cost '{"cheap": 1.0, "expensive": 10.0}'
+```
+
+**Key metrics:** Compare per-partition TTFT and per-partition hit rate
+between baseline and policy-enabled runs. The delta shows whether the
+policy improves fairness (ref caps) or smart prioritization (cost-aware).
+
+**Block pool micro-benchmark:**
+
+`benchmark_block_pool.py` already passes `"__bench__"` as partition ID.
+Extend to test:
+- `CostAwareFreeKVCacheBlockQueue` with multiple partition tags and
+  varying cost multipliers — measure victim selection overhead vs plain
+  LRU `popleft()`.
+- Quota enforcement overhead on `get_new_blocks()`.
+
 ## Implementation priorities
 
 1. ✅ Synthetic workloads (done)
 2. ✅ HELM few-shot (done)
 3. ✅ Budget sweep (done — `benchmark_kv_cache_budget_sweep.py`)
-4. **ShareGPT / BurstGPT / prefix_repetition online serving** — use existing
+4. ✅ Multi-partition offline benchmark (done — `--workload multi-partition`)
+5. **Run partition experiments on GPU** — tight cache budget needed to force
+   eviction; compare LRU vs LRU+quota vs LRU+cost-aware per-partition TTFT
+6. **ShareGPT / BurstGPT / prefix_repetition online serving** — use existing
    `vllm bench serve`, just need GPU
-5. **Synthetic agent traces** — generate `.jsonl` with agent-like patterns,
+7. **Synthetic agent traces** — generate `.jsonl` with agent-like patterns,
    feed to `vllm bench serve --dataset-name custom`
-6. **Block pool micro-benchmark** — extend `benchmark_block_pool.py` per policy
-7. **SCBench multi-request** — longer term, for final paper
-8. **GuideLLM** — consider for production-grade evaluation and reporting
+8. **Block pool micro-benchmark** — extend `benchmark_block_pool.py` to
+   sweep policies (LRU/SIEVE/S3-FIFO/cost-aware) and measure overhead
+9. **SCBench multi-request** — longer term, for final paper
+10. **GuideLLM** — consider for production-grade evaluation and reporting

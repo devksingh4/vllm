@@ -25,9 +25,27 @@ Examples:
       --model Qwen/Qwen2.5-0.5B --enable-prefix-caching \\
       --workload helm --helm-task copa --num-test 100
 
+  # Multi-partition fairness: asymmetric tenants competing for cache
+  # "hog" sends 4x more requests with short prefixes (cheap to recompute)
+  # "starved" sends fewer requests with long prefixes (expensive)
+  VLLM_KV_OFFLOAD_POLICY=lru python benchmarks/benchmark_kv_cache.py \\
+      --model Qwen/Qwen2.5-3B --enable-prefix-caching --enforce-eager \\
+      --workload multi-partition \\
+      --partition-config '{"hog": {"num_requests": 64, "prefix_words": 200}, \\
+                           "starved": {"num_requests": 16, "prefix_words": 2000}}'
+
+  # Same with cost-aware eviction (protect starved's expensive blocks)
+  VLLM_KV_OFFLOAD_POLICY=lru python benchmarks/benchmark_kv_cache.py \\
+      --model Qwen/Qwen2.5-3B --enable-prefix-caching --enforce-eager \\
+      --workload multi-partition \\
+      --partition-config '{"hog": {"num_requests": 64, "prefix_words": 200}, \\
+                           "starved": {"num_requests": 16, "prefix_words": 2000}}' \\
+      --kv-cache-partition-eviction-cost '{"hog": 1.0, "starved": 10.0}'
+
   # Budget sweep helper (see benchmark_kv_cache_budget_sweep.py)
 """
 
+import json
 import os
 import random
 import time
@@ -280,25 +298,139 @@ def workload_helm(
 
 
 # ---------------------------------------------------------------------------
+# Multi-partition workload (asymmetric tenants)
+# ---------------------------------------------------------------------------
+
+def workload_multi_partition(
+    partition_config: dict[str, dict],
+    batch_size: int,
+    suffix_words: int,
+) -> tuple[list[list[str]], list[list[str]]]:
+    """Generate batches with per-partition asymmetric workloads.
+
+    Each partition gets its own prefix pool and request count.  Batches are
+    interleaved across partitions (round-robin per-request, then chunked).
+
+    Args:
+        partition_config: ``{"pid": {"num_requests": N, "prefix_words": W, ...}}``.
+            Optional keys per partition: ``num_prefixes`` (default 10),
+            ``suffix_words`` (override global).
+        batch_size: Requests per batch.
+        suffix_words: Default suffix length.
+
+    Returns:
+        (batches, batch_partition_ids) where batch_partition_ids[i] is a list
+        of partition IDs parallel to batches[i] (per-request granularity).
+    """
+    # Build per-partition prompt lists
+    all_prompts: list[tuple[str, str]] = []  # (prompt, partition_id)
+    for pid, cfg in partition_config.items():
+        n_req = cfg.get("num_requests", 16)
+        pw = cfg.get("prefix_words", 200)
+        sw = cfg.get("suffix_words", suffix_words)
+        n_pfx = cfg.get("num_prefixes", 10)
+
+        prefixes = [
+            generate_shared_prefix(pw + j * 10, seed=hash(pid) + j)
+            for j in range(n_pfx)
+        ]
+        rng = random.Random(hash(pid))
+        for i in range(n_req):
+            pfx = prefixes[i % n_pfx]
+            q = _QUESTIONS[i % len(_QUESTIONS)]
+            prompt = _make_prompt(pfx, _unique_padding(rng, sw), q)
+            all_prompts.append((prompt, pid))
+
+    # Shuffle to interleave partitions (deterministic)
+    rng_shuffle = random.Random(42)
+    rng_shuffle.shuffle(all_prompts)
+
+    # Chunk into batches
+    batches: list[list[str]] = []
+    batch_pids: list[list[str]] = []
+    for i in range(0, len(all_prompts), batch_size):
+        chunk = all_prompts[i:i + batch_size]
+        batches.append([p for p, _ in chunk])
+        batch_pids.append([pid for _, pid in chunk])
+
+    # Print distribution summary
+    counts: dict[str, int] = defaultdict(int)
+    for _, pid in all_prompts:
+        counts[pid] += 1
+    print(f"Multi-partition request distribution: "
+          f"{dict(sorted(counts.items(), key=lambda x: -x[1]))}")
+
+    return batches, batch_pids
+
+
+# ---------------------------------------------------------------------------
 # Benchmark harness (shared by all workloads)
 # ---------------------------------------------------------------------------
 
+def _make_sp_for_partition(
+    base: SamplingParams, partition_id: str,
+) -> SamplingParams:
+    """Clone base SamplingParams with a cache_partition_id injected."""
+    return SamplingParams(
+        temperature=base.temperature,
+        max_tokens=base.max_tokens,
+        ignore_eos=base.ignore_eos,
+        extra_args={"cache_partition_id": partition_id},
+    )
+
+
 def run_benchmark(
-    llm: LLM, batches: list[list[str]], sampling_params: SamplingParams,
+    llm: LLM,
+    batches: list[list[str]],
+    sampling_params: SamplingParams,
+    batch_partition_ids: list[list[str]] | list[str] | None = None,
 ) -> dict:
-    """Run batches through the LLM and return collected metrics."""
+    """Run batches through the LLM and return collected metrics.
+
+    *batch_partition_ids* can be:
+      - ``None`` — no partition tagging.
+      - ``list[str]`` — one partition ID per batch (all requests in that
+        batch share the same partition).
+      - ``list[list[str]]`` — per-request partition IDs, parallel to
+        *batches* (each inner list has the same length as the
+        corresponding batch).
+    """
     total_in = 0
     total_out = 0
     batch_times: list[float] = []
     all_ttft: list[float] = []
+    partition_ttft: dict[str, list[float]] = defaultdict(list)
 
     num_batches = len(batches)
     print(f"\nRunning {num_batches} batches...")
     overall_start = time.time()
 
     for i, batch in enumerate(batches):
+        # Resolve partition IDs for this batch
+        pids: list[str] | None = None
+        if batch_partition_ids is not None:
+            entry = batch_partition_ids[i]
+            if isinstance(entry, str):
+                pids = [entry] * len(batch)
+            else:
+                pids = list(entry)
+
+        # Build SamplingParams: per-request if mixed partitions, else shared
+        if pids is not None:
+            unique_pids = set(pids)
+            if len(unique_pids) == 1:
+                # Uniform partition — single SamplingParams for the whole batch
+                sp: SamplingParams | list[SamplingParams] = _make_sp_for_partition(
+                    sampling_params, pids[0],
+                )
+            else:
+                # Mixed partitions — per-request SamplingParams
+                sp = [_make_sp_for_partition(sampling_params, p) for p in pids]
+        else:
+            sp = sampling_params
+
         t0 = time.time()
-        outputs = llm.generate(batch, sampling_params)
+        outputs = llm.generate(batch, sp)
         elapsed = time.time() - t0
         batch_times.append(elapsed)
 
@@ -308,18 +440,34 @@ def run_benchmark(
         total_out += b_out
 
         # Per-request TTFT
+        for j, o in enumerate(outputs):
+            if o.metrics is not None and o.metrics.first_token_latency > 0:
+                ttft_val = o.metrics.first_token_latency
+                all_ttft.append(ttft_val)
+                if pids is not None:
+                    partition_ttft[pids[j]].append(ttft_val)
+
         b_ttft = [
             o.metrics.first_token_latency
             for o in outputs
             if o.metrics is not None and o.metrics.first_token_latency > 0
         ]
-        all_ttft.extend(b_ttft)
-
         ttft_str = ""
         if b_ttft:
             ttft_str = f"  ttft_mean={sum(b_ttft)/len(b_ttft)*1000:.0f}ms"
 
-        print(f"  Batch {i+1}/{num_batches}: {elapsed:.2f}s "
+        # Batch label
+        if pids is not None:
+            pid_counts = defaultdict(int)
+            for p in pids:
+                pid_counts[p] += 1
+            pid_str = "  [" + "+".join(
+                f"{k}:{v}" for k, v in sorted(pid_counts.items())
+            ) + "]"
+        else:
+            pid_str = ""
+
+        print(f"  Batch {i+1}/{num_batches}{pid_str}: {elapsed:.2f}s "
               f"({b_in} in / {b_out} out){ttft_str}")
 
     wall = time.time() - overall_start
@@ -329,6 +477,7 @@ def run_benchmark(
         "total_out": total_out,
         "batch_times": batch_times,
         "all_ttft": all_ttft,
+        "partition_ttft": dict(partition_ttft),
     }
 
 
@@ -368,6 +517,20 @@ def print_results(metrics: dict, policy: str, workload: str) -> None:
     else:
         print("\nTTFT: not available (metrics not populated)")
 
+    # Per-partition breakdown (multi-partition mode)
+    part_ttft = metrics.get("partition_ttft", {})
+    if part_ttft:
+        print("\nPer-partition TTFT:")
+        for pid in sorted(part_ttft):
+            vals = sorted(part_ttft[pid])
+            pn = len(vals)
+            if pn == 0:
+                continue
+            print(f"  [{pid}] n={pn}  "
+                  f"mean={sum(vals)/pn*1000:.1f}ms  "
+                  f"p50={vals[pn//2]*1000:.1f}ms  "
+                  f"p99={vals[min(int(pn*0.99), pn-1)]*1000:.1f}ms")
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -381,7 +544,8 @@ def create_parser() -> FlexibleArgumentParser:
     # Workload selection
     p.add_argument(
         "--workload",
-        choices=["uniform", "zipfian", "temporal", "scan-resistant", "helm"],
+        choices=["uniform", "zipfian", "temporal", "scan-resistant", "helm",
+                 "multi-partition"],
         default="scan-resistant",
         help="Workload pattern (default: scan-resistant)",
     )
@@ -403,6 +567,21 @@ def create_parser() -> FlexibleArgumentParser:
                     help="Few-shot examples for HELM (default: 5)")
     p.add_argument("--num-test", type=int, default=500,
                     help="Test samples for HELM (default: 500)")
+
+    # Multi-partition support (cache-partition branch)
+    p.add_argument(
+        "--partitions", nargs="+", default=None,
+        help="Partition IDs for simple round-robin assignment on non-multi-partition "
+             "workloads. Example: --partitions model_a model_b",
+    )
+    p.add_argument(
+        "--partition-config", type=str, default=None,
+        help='JSON dict for --workload multi-partition. Each key is a partition '
+             'ID, value is {"num_requests": N, "prefix_words": W, '
+             '"num_prefixes": P, "suffix_words": S}. '
+             'Example: \'{"hog": {"num_requests": 64, "prefix_words": 200}, '
+             '"starved": {"num_requests": 16, "prefix_words": 2000}}\'',
+    )
 
     # CPU compat
     p.add_argument("--cpu-kv-cache-space", type=int, default=4,
@@ -427,7 +606,16 @@ def main():
     print(f"Workload:         {args.workload}")
 
     # Generate workload
-    if args.workload == "uniform":
+    batch_partition_ids: list[list[str]] | list[str] | None = None
+
+    if args.workload == "multi-partition":
+        if args.partition_config is None:
+            parser.error("--partition-config is required for --workload multi-partition")
+        pcfg = json.loads(args.partition_config)
+        batches, batch_partition_ids = workload_multi_partition(
+            pcfg, args.batch_size, args.suffix_words,
+        )
+    elif args.workload == "uniform":
         batches = workload_uniform(
             args.num_batches, args.batch_size,
             args.prefix_words, args.suffix_words,
@@ -442,6 +630,13 @@ def main():
             args.prefix_words, args.suffix_words, args.num_prefixes,
             args.zipfian_alpha, args.working_set_size,
         )
+
+    # Simple round-robin partition assignment for non-multi-partition workloads
+    if batch_partition_ids is None and args.partitions:
+        parts = args.partitions
+        batch_partition_ids = [parts[i % len(parts)] for i in range(len(batches))]
+        print(f"Partitions:       {parts}")
+        print(f"Batch→partition:  {batch_partition_ids}")
 
     # Build LLM from engine args (same pattern as benchmark_prefix_caching.py)
     engine_args = EngineArgs.from_cli_args(args)
@@ -464,8 +659,10 @@ def main():
     workload_label = args.workload
     if args.workload == "helm":
         workload_label = f"helm-{args.helm_task}"
+    elif args.workload == "multi-partition":
+        workload_label = "multi-partition"
 
-    metrics = run_benchmark(llm, batches, sampling_params)
+    metrics = run_benchmark(llm, batches, sampling_params, batch_partition_ids)
     print_results(metrics, policy, workload_label)
 
 

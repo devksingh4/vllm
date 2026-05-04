@@ -210,6 +210,7 @@ class InputProcessor:
         mc = self.model_config
         return get_served_model_name(mc.model, mc.served_model_name)
 
+    @staticmethod
     def assign_request_id(request: EngineCoreRequest):
         """Replace the externally supplied request ID with an internal request ID
         that adds 8 random characters in order to ensure uniqueness.
