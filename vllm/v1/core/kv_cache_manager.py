@@ -116,6 +116,8 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        partition_ref_caps: dict[str, int] | None = None,
+        partition_eviction_cost: dict[str, float] | None = None,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -138,6 +140,8 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            partition_ref_caps=partition_ref_caps,
+            partition_eviction_cost=partition_eviction_cost,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -151,6 +155,10 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+    def set_partition_ref_caps(self, caps: dict[str, int] | None) -> None:
+        """Update two-level per-partition ref caps on the GPU block pool (runtime)."""
+        self.block_pool.set_partition_ref_caps(caps)
 
     @property
     def usage(self) -> float:

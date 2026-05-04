@@ -126,6 +126,12 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Multi-model shared-device eviction hints (optional; see BlockPool policy).
+    # Updated on alloc/touch/free to attribute the last logical partition and
+    # a monotonic access stamp from the owning BlockPool.
+    kv_eviction_tag: str = ""
+    kv_access_seq: int = 0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -364,6 +370,87 @@ class FreeKVCacheBlockQueue:
             ret.append(curr_block)
             curr_block = curr_block.next_free_block
         return ret
+
+
+class CostAwareFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
+    """LRU-like free list with GreedyDual-style victim selection among a scan window.
+
+    Among the first ``scan_window`` blocks from the LRU head, evicts the block
+    with the largest ``idle / cost(partition_tag)``, where ``idle`` is
+    ``logical_now - kv_access_seq``. This favors keeping data from partitions
+    with higher relative prefill cost when staleness is comparable.
+
+    Requires ``kv_access_seq`` and ``kv_eviction_tag`` to be maintained by the
+    ``BlockPool`` (see ``_note_block_partition_activity``).
+    """
+
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        cost_for_partition: Callable[[str], float],
+        logical_now_fn: Callable[[], int],
+        scan_window: int = 32,
+    ) -> None:
+        super().__init__(blocks)
+        self._cost_for = cost_for_partition
+        self._logical_now_fn = logical_now_fn
+        self._scan_window = max(1, scan_window)
+
+    def _cost(self, tag: str) -> float:
+        if not tag:
+            return 1.0
+        c = self._cost_for(tag)
+        return float(c) if c > 0 else 1.0
+
+    def popleft(self) -> KVCacheBlock:
+        if (
+            self.fake_free_list_head.next_free_block is self.fake_free_list_tail
+            or self.fake_free_list_head.next_free_block is None
+        ):
+            assert self.num_free_blocks == 0, (
+                f"num_free_blocks ({self.num_free_blocks}) is out of sync "
+                "with the free list."
+            )
+            raise ValueError("No free blocks available")
+
+        now = self._logical_now_fn()
+        first_block: KVCacheBlock = self.fake_free_list_head.next_free_block
+        assert first_block.next_free_block is not None
+
+        best = first_block
+        best_score = (now - best.kv_access_seq) / self._cost(best.kv_eviction_tag)
+        curr: KVCacheBlock | None = first_block
+        scanned = 0
+        while (
+            curr is not None
+            and curr is not self.fake_free_list_tail
+            and scanned < self._scan_window
+        ):
+            score = (now - curr.kv_access_seq) / self._cost(curr.kv_eviction_tag)
+            if score > best_score:
+                best_score = score
+                best = curr
+            curr = curr.next_free_block
+            scanned += 1
+
+        if best is first_block:
+            self.fake_free_list_head.next_free_block = first_block.next_free_block
+            first_block.next_free_block.prev_free_block = self.fake_free_list_head
+        else:
+            assert best.prev_free_block is not None
+            assert best.next_free_block is not None
+            best.prev_free_block.next_free_block = best.next_free_block
+            best.next_free_block.prev_free_block = best.prev_free_block
+
+        best.prev_free_block = best.next_free_block = None
+        self.num_free_blocks -= 1
+        return best
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+        return [self.popleft() for _ in range(n)]
 
 
 _S3FIFO_MAX_FREQ: int = 3

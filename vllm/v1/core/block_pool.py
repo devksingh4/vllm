@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
+    CostAwareFreeKVCacheBlockQueue,
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
@@ -156,21 +157,59 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        partition_ref_caps: dict[str, int] | None = None,
+        partition_eviction_cost: dict[str, float] | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        self._partition_ref_caps = (
+            dict(partition_ref_caps) if partition_ref_caps is not None else None
+        )
+        self._partition_eviction_cost = (
+            dict(partition_eviction_cost)
+            if partition_eviction_cost is not None
+            else None
+        )
+        self._kv_logical_time = 0
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
         gpu_policy = (envs.VLLM_KV_OFFLOAD_POLICY or "").lower()
-        if gpu_policy == "s3fifo":
+        use_cost_queue = (
+            self._partition_eviction_cost is not None
+            and gpu_policy not in ("s3fifo", "sieve")
+        )
+        if use_cost_queue:
+            cost_map = self._partition_eviction_cost
+
+            def _cost_for_partition(pid: str) -> float:
+                c = cost_map.get(pid, 1.0)
+                return float(c) if c > 0 else 1.0
+
+            self.free_block_queue = CostAwareFreeKVCacheBlockQueue(
+                self.blocks,
+                cost_for_partition=_cost_for_partition,
+                logical_now_fn=lambda: self._kv_logical_time,
+            )
+            gpu_policy = "lru+cost_aware"
+        elif gpu_policy == "s3fifo":
+            if self._partition_eviction_cost is not None:
+                logger.warning(
+                    "partition_eviction_cost is ignored when GPU eviction policy "
+                    "is s3fifo (VLLM_KV_OFFLOAD_POLICY)."
+                )
             self.free_block_queue: (
                 FreeKVCacheBlockQueue | S3FIFOFreeBlockQueue | SIEVEFreeBlockQueue
             ) = S3FIFOFreeBlockQueue(self.blocks)
         elif gpu_policy == "sieve":
+            if self._partition_eviction_cost is not None:
+                logger.warning(
+                    "partition_eviction_cost is ignored when GPU eviction policy "
+                    "is sieve (VLLM_KV_OFFLOAD_POLICY)."
+                )
             self.free_block_queue = SIEVEFreeBlockQueue(self.blocks)
         else:
             gpu_policy = "lru"
@@ -198,6 +237,23 @@ class BlockPool:
     def get_partition_block_ref_totals(self) -> dict[str, int]:
         """Snapshot of ref_cnt contributions attributed to each cache partition."""
         return dict(self._partition_block_ref_totals)
+
+    def set_partition_ref_caps(self, caps: dict[str, int] | None) -> None:
+        """Dynamic two-level budgets: max ref-count contributions per partition.
+
+        Used by higher-level controllers to reapportion capacity without
+        restarting the engine. ``None`` disables caps.
+        """
+        self._partition_ref_caps = dict(caps) if caps is not None else None
+
+    def _note_block_partition_activity(
+        self, block: KVCacheBlock, cache_partition_id: str
+    ) -> None:
+        if block.is_null:
+            return
+        self._kv_logical_time += 1
+        block.kv_access_seq = self._kv_logical_time
+        block.kv_eviction_tag = cache_partition_id
 
     def _partition_note_ref(
         self, block: KVCacheBlock, cache_partition_id: str, delta: int
@@ -385,6 +441,17 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        if self._partition_ref_caps is not None:
+            cap = self._partition_ref_caps.get(cache_partition_id)
+            if cap is not None:
+                cur = self._partition_block_ref_totals.get(cache_partition_id, 0)
+                if cur + num_blocks > cap:
+                    raise ValueError(
+                        "cache_partition_id "
+                        f"{cache_partition_id!r} would exceed ref cap "
+                        f"({cur} + {num_blocks} > {cap}); two-level quota policy"
+                    )
+
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
@@ -394,6 +461,7 @@ class BlockPool:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 self._partition_note_ref(block, cache_partition_id, 1)
+                self._note_block_partition_activity(block, cache_partition_id)
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
@@ -401,6 +469,7 @@ class BlockPool:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 self._partition_note_ref(block, cache_partition_id, 1)
+                self._note_block_partition_activity(block, cache_partition_id)
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
@@ -462,6 +531,7 @@ class BlockPool:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             self._partition_note_ref(block, cache_partition_id, 1)
+            self._note_block_partition_activity(block, cache_partition_id)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -481,13 +551,15 @@ class BlockPool:
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
+        to_append: list[KVCacheBlock] = []
         for block in blocks_list:
             block.ref_cnt -= 1
             if not block.is_null:
                 self._partition_note_ref(block, cache_partition_id, -1)
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+            if block.ref_cnt == 0 and not block.is_null:
+                self._note_block_partition_activity(block, cache_partition_id)
+                to_append.append(block)
+        self.free_block_queue.append_n(to_append)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

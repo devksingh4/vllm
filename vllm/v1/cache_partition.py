@@ -3,8 +3,18 @@
 """Multi-model KV cache partitioning (plumbing and metrics).
 
 `cache_partition_id` identifies a logical owner for KV block ref accounting
-(e.g. a served base model or an explicit tenant). Scheduling and eviction
-policies are unchanged; only attribution for metrics is tracked today.
+(e.g. a served base model or an explicit tenant).
+
+Optional **shared-device** experiments on :class:`~vllm.v1.core.block_pool.BlockPool`:
+
+- **Two-level quotas:** pass ``partition_ref_caps={partition_id: max_refs}`` to
+  cap ref-count contributions per partition (raises if exceeded). Use
+  :meth:`~vllm.v1.core.block_pool.BlockPool.set_partition_ref_caps` for
+  rate-limited reapportionment.
+- **Single-level cost-aware eviction:** pass ``partition_eviction_cost`` (relative
+  prefill cost multipliers). Uses an LRU scan-window policy that evicts
+  ``argmax`` of ``(logical_now - last_touch) / cost`` among the first N free
+  blocks (GreedyDual-like; only composes with default LRU, not s3fifo/sieve).
 
 Request metadata:
     - Generation: ``SamplingParams.extra_args["cache_partition_id"]`` (string).
