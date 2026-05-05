@@ -70,6 +70,12 @@ class SIEVECachePolicy(CachePolicy):
 
     def insert(self, block_hash: BlockHash, block: BlockStatus) -> None:
         self.stats.insert_calls += 1
+        # Guard against duplicate inserts: if a node for this hash already
+        # exists, drop it first so we don't leave an orphan in the linked
+        # list (which would then surface as a KeyError on later eviction
+        # when del self._map[node.block_hash] runs against the stale node).
+        if block_hash in self._map:
+            self.remove(block_hash)
         node = _SieveNode(block_hash, block)
         self._map[block_hash] = node
         # Prepend at head
@@ -161,7 +167,11 @@ class SIEVECachePolicy(CachePolicy):
         self._hand = hand
         result: list[tuple[BlockHash, BlockStatus]] = []
         for node in candidates:
-            del self._map[node.block_hash]
+            # pop, not del: tolerate the case where _map no longer holds this
+            # hash (e.g. a duplicate node lingering in the linked list after
+            # an earlier insert overwrote the map entry). The unlink and the
+            # returned (hash, block) are still correct.
+            self._map.pop(node.block_hash, None)
             self._unlink_no_hand(node)
             result.append((node.block_hash, node.block))
 

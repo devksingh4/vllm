@@ -14,15 +14,142 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import time
 from collections import defaultdict
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
+import numpy as np
 from huggingface_hub import snapshot_download
 
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
+
+
+_PREFIX_WORDS = [
+    "algorithm", "optimization", "throughput", "latency", "bandwidth",
+    "pipeline", "scheduler", "prefetch", "eviction", "allocation",
+    "partition", "replication", "consistency", "transaction", "isolation",
+    "concurrency", "parallelism", "synchronization", "deadlock", "mutex",
+    "processor", "register", "instruction", "operand", "accumulator",
+    "interrupt", "exception", "privilege", "virtual", "physical",
+]
+
+_QUESTIONS = [
+    "Summarize the key themes in one sentence.",
+    "What optimization technique appears most often?",
+    "List three concepts related to concurrency.",
+    "Identify a potential trade-off mentioned in the text.",
+    "Which scheduling concept is most relevant to latency?",
+    "What is the relationship between throughput and bandwidth?",
+    "Name a synchronization primitive from the passage.",
+    "How does the pipeline concept relate to parallelism here?",
+    "What memory-management concepts are discussed?",
+    "Describe the main topic in exactly two words.",
+]
+
+
+def gen_multi_turn_prompts(
+    num_requests: int,
+    num_sessions: int,
+    num_adapters: int,
+    turns_per_session: int,
+    one_shot_fraction: float,
+    system_prompt_words: int,
+    user_msg_words: int,
+    assistant_resp_words: int,
+    one_shot_prefix_words: int,
+    zipfian_alpha: float,
+    seed: int = 42,
+) -> list[tuple[str, int]]:
+    """Multi-turn chat workload paired with LoRA adapters.
+
+    Mirrors the multi-turn workload from benchmark_kv_cache.py: a long shared
+    system prompt plus N concurrent sessions whose prefixes grow turn over
+    turn, sampled Zipfian by session popularity. A configurable fraction of
+    requests are one-shot scan queries.
+
+    Each session is bound to a single LoRA adapter (round-robin assignment),
+    so adapter affinity follows session affinity — exercising both prefix
+    caching and the LoRA cache simultaneously.
+
+    Returns a list of (prompt, adapter_idx) tuples.
+    """
+    rng = random.Random(seed)
+    np_rng = np.random.default_rng(seed)
+
+    system_prompt = " ".join(
+        random.Random(seed + 1).choices(_PREFIX_WORDS, k=system_prompt_words)
+    )
+
+    # session_id -> adapter_idx (round-robin so hot sessions spread across
+    # adapters; with num_sessions >= num_adapters every adapter sees traffic).
+    session_to_adapter = [s % num_adapters for s in range(num_sessions)]
+
+    sessions: list[list[str]] = []
+    for sid in range(num_sessions):
+        s_rng = random.Random(seed + sid + 1)
+        history = ""
+        turn_prompts: list[str] = []
+        for _ in range(turns_per_session):
+            user_msg = " ".join(s_rng.choices(_PREFIX_WORDS, k=user_msg_words))
+            full_prompt = (
+                f"{system_prompt}\n{history}\nUser: {user_msg}\nAssistant:"
+            )
+            turn_prompts.append(full_prompt)
+            assistant_resp = " ".join(
+                s_rng.choices(_PREFIX_WORDS, k=assistant_resp_words)
+            )
+            history += f"\nUser: {user_msg}\nAssistant: {assistant_resp}\n"
+        sessions.append(turn_prompts)
+
+    session_probs = 1.0 / (np.arange(1, num_sessions + 1) ** zipfian_alpha)
+    session_probs /= session_probs.sum()
+    session_cursors = [0] * num_sessions
+
+    out: list[tuple[str, int]] = []
+    one_shot_count = 0
+    session_call_counts: dict[int, int] = defaultdict(int)
+    for i in range(num_requests):
+        if rng.random() < one_shot_fraction:
+            unique = " ".join(
+                rng.choices(_PREFIX_WORDS, k=one_shot_prefix_words)
+            )
+            q = _QUESTIONS[i % len(_QUESTIONS)]
+            prompt = (
+                f"{system_prompt}\n\n{unique}\n\nQuestion: {q}\nAnswer:"
+            )
+            # One-shot queries get a random adapter (no session affinity).
+            out.append((prompt, rng.randrange(num_adapters)))
+            one_shot_count += 1
+        else:
+            sid = int(np_rng.choice(num_sessions, p=session_probs))
+            tid = session_cursors[sid] % turns_per_session
+            session_cursors[sid] += 1
+            session_call_counts[sid] += 1
+            out.append((sessions[sid][tid], session_to_adapter[sid]))
+
+    avg_session_tokens = (
+        system_prompt_words
+        + turns_per_session * (user_msg_words + assistant_resp_words)
+    )
+    print(
+        f"Multi-turn workload: {num_sessions} sessions × "
+        f"{turns_per_session} turns ({avg_session_tokens} words deep), "
+        f"{one_shot_count}/{num_requests} one-shot "
+        f"({one_shot_count / num_requests:.0%}), "
+        f"system_prompt={system_prompt_words} words, "
+        f"adapters={num_adapters}"
+    )
+    top_sessions = sorted(
+        session_call_counts.items(), key=lambda kv: -kv[1]
+    )[:5]
+    print(
+        f"Hottest 5 sessions (calls): "
+        f"{ {f's{sid}->a{session_to_adapter[sid]}': c for sid, c in top_sessions} }"
+    )
+    return out
 
 
 def _import_e2e_helpers():
@@ -48,9 +175,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-lora-rank", type=int, default=16)
     p.add_argument(
         "--scenario",
-        choices=["adapter_thrashing", "adapter_locality", "mixed_popularity"],
+        choices=[
+            "adapter_thrashing",
+            "adapter_locality",
+            "mixed_popularity",
+            "multi_turn",
+        ],
         default="adapter_thrashing",
     )
+    # multi_turn workload params (mirrors benchmark_kv_cache.py)
+    p.add_argument("--num-sessions", type=int, default=16,
+                   help="Concurrent chat sessions (multi_turn)")
+    p.add_argument("--turns-per-session", type=int, default=6,
+                   help="Turns per session, prefix grows each turn (multi_turn)")
+    p.add_argument("--one-shot-fraction", type=float, default=0.2,
+                   help="Fraction of requests that are one-shot scan queries (multi_turn)")
+    p.add_argument("--system-prompt-words", type=int, default=400,
+                   help="Length of the shared system prompt prepended to all requests (multi_turn)")
+    p.add_argument("--user-msg-words", type=int, default=40,
+                   help="Words per user turn (multi_turn)")
+    p.add_argument("--assistant-resp-words", type=int, default=80,
+                   help="Words per assistant turn (multi_turn)")
+    p.add_argument("--one-shot-prefix-words", type=int, default=300,
+                   help="Words of unique padding for one-shot queries (multi_turn)")
     p.add_argument("--policy", default=None)
     p.add_argument("--num-requests", type=int, default=80)
     p.add_argument("--batch-size", type=int, default=8)
@@ -95,31 +242,49 @@ def main() -> None:
         for i in range(args.num_adapters)
     ]
 
-    if args.scenario == "adapter_thrashing":
-        adapter_indices = helpers.gen_adapter_thrashing(
-            args.num_requests, args.num_adapters
+    if args.scenario == "multi_turn":
+        prompts_and_adapters = gen_multi_turn_prompts(
+            num_requests=args.num_requests,
+            num_sessions=args.num_sessions,
+            num_adapters=args.num_adapters,
+            turns_per_session=args.turns_per_session,
+            one_shot_fraction=args.one_shot_fraction,
+            system_prompt_words=args.system_prompt_words,
+            user_msg_words=args.user_msg_words,
+            assistant_resp_words=args.assistant_resp_words,
+            one_shot_prefix_words=args.one_shot_prefix_words,
+            zipfian_alpha=args.zipfian_alpha,
+            seed=args.seed,
         )
-    elif args.scenario == "adapter_locality":
-        adapter_indices = helpers.gen_adapter_locality(
-            args.num_requests, args.num_adapters, args.burst_len, args.seed
-        )
+        prompts_with_lora = [
+            (prompt, lora_requests[a]) for prompt, a in prompts_and_adapters
+        ]
     else:
-        adapter_indices = helpers.gen_mixed_popularity(
-            args.num_requests,
-            args.num_adapters,
-            args.zipfian_alpha,
-            args.seed,
-        )
+        if args.scenario == "adapter_thrashing":
+            adapter_indices = helpers.gen_adapter_thrashing(
+                args.num_requests, args.num_adapters
+            )
+        elif args.scenario == "adapter_locality":
+            adapter_indices = helpers.gen_adapter_locality(
+                args.num_requests, args.num_adapters, args.burst_len, args.seed
+            )
+        else:
+            adapter_indices = helpers.gen_mixed_popularity(
+                args.num_requests,
+                args.num_adapters,
+                args.zipfian_alpha,
+                args.seed,
+            )
 
-    prompts_with_lora = [
-        (
-            helpers._build_prompt(
-                a, args.prefix_words, args.suffix_words, i
-            ),
-            lora_requests[a],
-        )
-        for i, a in enumerate(adapter_indices)
-    ]
+        prompts_with_lora = [
+            (
+                helpers._build_prompt(
+                    a, args.prefix_words, args.suffix_words, i
+                ),
+                lora_requests[a],
+            )
+            for i, a in enumerate(adapter_indices)
+        ]
 
     print(f"\nLoading {args.model}...")
     llm = LLM(
@@ -135,6 +300,7 @@ def main() -> None:
         kv_offloading_size=args.kv_offloading_size,
         disable_hybrid_kv_cache_manager=True,
         enable_prefix_caching=True,
+        disable_log_stats=False,
     )
     engine = llm.llm_engine
 
