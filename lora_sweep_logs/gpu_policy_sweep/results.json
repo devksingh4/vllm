@@ -1,0 +1,101 @@
+[
+  {
+    "gpu_policy": "lru",
+    "scenario": "adapter_thrashing",
+    "ok": false,
+    "timed_out": false,
+    "elapsed_wallclock_s": 23.160927772521973,
+    "log_path": "/home/dsingh/source/devksingh4/vllm/lora_sweep_logs/gpu_policy_sweep/gpu_lru__adapter_thrashing.log",
+    "hit_blocks": 0,
+    "lookup_blocks": 452,
+    "hit_rate_pct": "0.00%"
+  },
+  {
+    "gpu_policy": "lru",
+    "scenario": "adapter_locality",
+    "ok": false,
+    "timed_out": false,
+    "elapsed_wallclock_s": 20.022507667541504,
+    "log_path": "/home/dsingh/source/devksingh4/vllm/lora_sweep_logs/gpu_policy_sweep/gpu_lru__adapter_locality.log",
+    "hit_blocks": 0,
+    "lookup_blocks": 408,
+    "hit_rate_pct": "0.00%"
+  },
+  {
+    "gpu_policy": "lru",
+    "scenario": "mixed_popularity",
+    "ok": false,
+    "timed_out": false,
+    "elapsed_wallclock_s": 20.177021265029907,
+    "log_path": "/home/dsingh/source/devksingh4/vllm/lora_sweep_logs/gpu_policy_sweep/gpu_lru__mixed_popularity.log",
+    "hit_blocks": 0,
+    "lookup_blocks": 478,
+    "hit_rate_pct": "0.00%"
+  },
+  {
+    "gpu_policy": "s3fifo",
+    "scenario": "adapter_thrashing",
+    "ok": false,
+    "timed_out": false,
+    "elapsed_wallclock_s": 20.312706470489502,
+    "log_path": "/home/dsingh/source/devksingh4/vllm/lora_sweep_logs/gpu_policy_sweep/gpu_s3fifo__adapter_thrashing.log",
+    "hit_blocks": 0,
+    "lookup_blocks": 452,
+    "hit_rate_pct": "0.00%"
+  },
+  {
+    "gpu_policy": "s3fifo",
+    "scenario": "adapter_locality",
+    "ok": false,
+    "timed_out": false,
+    "elapsed_wallclock_s": 20.334412574768066,
+    "log_path": "/home/dsingh/source/devksingh4/vllm/lora_sweep_logs/gpu_policy_sweep/gpu_s3fifo__adapter_locality.log",
+    "hit_blocks": 0,
+    "lookup_blocks": 408,
+    "hit_rate_pct": "0.00%"
+  },
+  {
+    "gpu_policy": "s3fifo",
+    "scenario": "mixed_popularity",
+    "ok": false,
+    "timed_out": false,
+    "elapsed_wallclock_s": 20.39962148666382,
+    "log_path": "/home/dsingh/source/devksingh4/vllm/lora_sweep_logs/gpu_policy_sweep/gpu_s3fifo__mixed_popularity.log",
+    "hit_blocks": 0,
+    "lookup_blocks": 478,
+    "hit_rate_pct": "0.00%"
+  },
+  {
+    "gpu_policy": "sieve",
+    "scenario": "adapter_thrashing",
+    "ok": false,
+    "timed_out": false,
+    "elapsed_wallclock_s": 20.151464700698853,
+    "log_path": "/home/dsingh/source/devksingh4/vllm/lora_sweep_logs/gpu_policy_sweep/gpu_sieve__adapter_thrashing.log",
+    "hit_blocks": 0,
+    "lookup_blocks": 452,
+    "hit_rate_pct": "0.00%"
+  },
+  {
+    "gpu_policy": "sieve",
+    "scenario": "adapter_locality",
+    "ok": false,
+    "timed_out": false,
+    "elapsed_wallclock_s": 19.967038869857788,
+    "log_path": "/home/dsingh/source/devksingh4/vllm/lora_sweep_logs/gpu_policy_sweep/gpu_sieve__adapter_locality.log",
+    "hit_blocks": 0,
+    "lookup_blocks": 408,
+    "hit_rate_pct": "0.00%"
+  },
+  {
+    "gpu_policy": "sieve",
+    "scenario": "mixed_popularity",
+    "ok": false,
+    "timed_out": false,
+    "elapsed_wallclock_s": 20.1675968170166,
+    "log_path": "/home/dsingh/source/devksingh4/vllm/lora_sweep_logs/gpu_policy_sweep/gpu_sieve__mixed_popularity.log",
+    "hit_blocks": 0,
+    "lookup_blocks": 478,
+    "hit_rate_pct": "0.00%"
+  }
+]
