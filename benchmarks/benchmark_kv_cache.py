@@ -298,6 +298,113 @@ def workload_helm(
 
 
 # ---------------------------------------------------------------------------
+# Multi-turn chat workload (realistic LLM serving pattern)
+# ---------------------------------------------------------------------------
+
+def workload_multi_turn(
+    num_batches: int,
+    batch_size: int,
+    num_sessions: int,
+    turns_per_session: int,
+    one_shot_fraction: float,
+    system_prompt_words: int,
+    user_msg_words: int,
+    assistant_resp_words: int,
+    one_shot_prefix_words: int,
+    zipfian_alpha: float,
+    seed: int = 42,
+) -> list[list[str]]:
+    """Multi-turn chat workload designed to stress prefix caching.
+
+    Simulates production LLM serving: a long shared system prompt prepended
+    to every request, plus N concurrent sessions whose prefixes grow turn
+    over turn (turn k+1 includes the full conversation through turn k),
+    sampled Zipfian by session popularity. A configurable fraction of
+    requests are one-shot queries with unique padding — these are pure scan
+    pressure that LRU famously mishandles.
+
+    The workload mixes three pressures eviction policies must balance:
+      1. The system prompt (huge shared block, present in every request).
+      2. Hot session histories (deep, growing, accessed in bursts).
+      3. One-shot scans (dilute the cache; never reused).
+    """
+    rng = random.Random(seed)
+    np.random.seed(seed)
+
+    # Shared system prompt — every request prepends this.
+    system_prompt = generate_shared_prefix(system_prompt_words, seed=1)
+
+    # Pre-generate each session's turn prompts. Turn t includes the full
+    # conversation history up to (but excluding) turn t's response, so the
+    # cacheable prefix grows monotonically.
+    sessions: list[list[str]] = []
+    for sid in range(num_sessions):
+        s_rng = random.Random(seed + sid + 1)
+        history = ""
+        turn_prompts: list[str] = []
+        for _ in range(turns_per_session):
+            user_msg = " ".join(s_rng.choices(_PREFIX_WORDS, k=user_msg_words))
+            full_prompt = (
+                f"{system_prompt}\n{history}\nUser: {user_msg}\nAssistant:"
+            )
+            turn_prompts.append(full_prompt)
+            # Append this turn's user msg + a synthetic assistant response so
+            # the next turn's prefix grows realistically.
+            assistant_resp = " ".join(
+                s_rng.choices(_PREFIX_WORDS, k=assistant_resp_words)
+            )
+            history += f"\nUser: {user_msg}\nAssistant: {assistant_resp}\n"
+        sessions.append(turn_prompts)
+
+    # Build the request stream.
+    n_total = num_batches * batch_size
+
+    # Zipfian session popularity (lower index = hotter).
+    session_probs = 1.0 / (np.arange(1, num_sessions + 1) ** zipfian_alpha)
+    session_probs /= session_probs.sum()
+    session_cursors = [0] * num_sessions  # next turn index per session
+
+    requests: list[str] = []
+    one_shot_count = 0
+    session_call_counts: dict[int, int] = defaultdict(int)
+    for i in range(n_total):
+        if rng.random() < one_shot_fraction:
+            unique = " ".join(rng.choices(_PREFIX_WORDS, k=one_shot_prefix_words))
+            q = _QUESTIONS[i % len(_QUESTIONS)]
+            requests.append(
+                f"{system_prompt}\n\n{unique}\n\nQuestion: {q}\nAnswer:"
+            )
+            one_shot_count += 1
+        else:
+            sid = int(np.random.choice(num_sessions, p=session_probs))
+            tid = session_cursors[sid] % turns_per_session
+            session_cursors[sid] += 1
+            session_call_counts[sid] += 1
+            requests.append(sessions[sid][tid])
+
+    # Working-set summary so the user can size the cache appropriately.
+    avg_session_tokens = (
+        system_prompt_words
+        + turns_per_session * (user_msg_words + assistant_resp_words)
+    )
+    print(
+        f"Multi-turn workload: {num_sessions} sessions × {turns_per_session} turns "
+        f"({avg_session_tokens} words deep), "
+        f"{one_shot_count}/{n_total} one-shot ({one_shot_count/n_total:.0%}), "
+        f"system_prompt={system_prompt_words} words"
+    )
+    top_sessions = sorted(
+        session_call_counts.items(), key=lambda kv: -kv[1]
+    )[:5]
+    print(
+        f"Hottest 5 sessions (calls): "
+        f"{ {f's{sid}': c for sid, c in top_sessions} }"
+    )
+
+    return [requests[i:i + batch_size] for i in range(0, n_total, batch_size)]
+
+
+# ---------------------------------------------------------------------------
 # Multi-partition workload (asymmetric tenants)
 # ---------------------------------------------------------------------------
 
@@ -545,9 +652,9 @@ def create_parser() -> FlexibleArgumentParser:
     p.add_argument(
         "--workload",
         choices=["uniform", "zipfian", "temporal", "scan-resistant", "helm",
-                 "multi-partition"],
+                 "multi-partition", "multi-turn"],
         default="zipfian",
-        help="Workload pattern (default: scan-resistant)",
+        help="Workload pattern (default: zipfian)",
     )
 
     # Synthetic workload params
@@ -559,6 +666,24 @@ def create_parser() -> FlexibleArgumentParser:
     p.add_argument("--num-prefixes", type=int, default=80)
     p.add_argument("--zipfian-alpha", type=float, default=1.5)
     p.add_argument("--working-set-size", type=int, default=15)
+
+    # Multi-turn params (realistic chat workload).
+    # Defaults are tuned to saturate ~60K-token GPU caches: ~150K tokens of
+    # session content + 25% scan pressure forces real eviction decisions.
+    p.add_argument("--num-sessions", type=int, default=50,
+                    help="Concurrent chat sessions (multi-turn)")
+    p.add_argument("--turns-per-session", type=int, default=6,
+                    help="Turns per session, prefix grows each turn (multi-turn)")
+    p.add_argument("--one-shot-fraction", type=float, default=0.25,
+                    help="Fraction of requests that are one-shot scan queries (multi-turn)")
+    p.add_argument("--system-prompt-words", type=int, default=1500,
+                    help="Length of the shared system prompt prepended to all requests (multi-turn)")
+    p.add_argument("--user-msg-words", type=int, default=80,
+                    help="Words per user turn (multi-turn)")
+    p.add_argument("--assistant-resp-words", type=int, default=250,
+                    help="Words per assistant turn (multi-turn)")
+    p.add_argument("--one-shot-prefix-words", type=int, default=400,
+                    help="Words of unique padding for one-shot queries (multi-turn)")
 
     # HELM params
     p.add_argument("--helm-task", choices=["copa", "piqa", "winogrande"],
@@ -623,6 +748,14 @@ def main():
     elif args.workload == "helm":
         batches = workload_helm(
             args.helm_task, args.num_examples, args.num_test, args.batch_size,
+        )
+    elif args.workload == "multi-turn":
+        batches = workload_multi_turn(
+            args.num_batches, args.batch_size,
+            args.num_sessions, args.turns_per_session,
+            args.one_shot_fraction, args.system_prompt_words,
+            args.user_msg_words, args.assistant_resp_words,
+            args.one_shot_prefix_words, args.zipfian_alpha,
         )
     else:
         batches = workload_patterned(
