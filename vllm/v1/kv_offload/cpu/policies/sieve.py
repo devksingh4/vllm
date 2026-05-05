@@ -35,6 +35,23 @@ class _SieveNode:
 class SIEVECachePolicy(CachePolicy):
     """
     SIEVE cache policy backed by a doubly-linked list and a hash map.
+
+    Data Structures:
+        - A doubly-linked list (head ↔ … ↔ tail) of _SieveNode entries.
+          head.next → … → tail  (next goes toward tail / older end).
+          New entries are inserted at the *head* (newest end).
+        - A dict mapping BlockHash → _SieveNode for O(1) lookup/removal.
+        - A "hand" pointer initialized at the tail.  During eviction it
+          scans toward the head (via .prev), wrapping to the tail when it
+          passes the head.
+
+    Algorithm:
+        insert: Prepend a new node at the head with visited=False.
+        touch:  Set visited=True on the node (no list rearrangement).
+        evict:  Starting from the hand, scan via .prev (toward head):
+            - If visited=True: reset to False, advance hand.
+            - If visited=False and eligible (ref_cnt==0, not protected): evict.
+          The hand advances past each evicted node.
     """
 
     def __init__(self, cache_capacity: int) -> None:
@@ -101,7 +118,7 @@ class SIEVECachePolicy(CachePolicy):
         cleared: list[_SieveNode] = []
 
         # Bound total iterations to avoid infinite loops when there are fewer
-        # eligible entries than n.  Two full passes: one to clear
+        # eligible entries than n.  Two full passes suffice: one to clear
         # visited bits and a second to collect the now-unvisited entries.
         max_steps = 2 * len(self._map)
         scan_steps = 0
@@ -124,6 +141,7 @@ class SIEVECachePolicy(CachePolicy):
                 candidate_ids.add(id(hand))
                 hand = self._advance(hand)
             else:
+                # In-flight (ref_cnt > 0), protected, or already selected.
                 hand = self._advance(hand)
 
         self.stats.evict_scan_steps += scan_steps
@@ -137,6 +155,9 @@ class SIEVECachePolicy(CachePolicy):
             return None
 
         # Commit: update persistent hand, then unlink candidates.
+        # The hand was already advanced past every candidate during the scan,
+        # so we must NOT touch self._hand inside the unlink loop — adjacent
+        # candidates may already have stale prev/next links.
         self._hand = hand
         result: list[tuple[BlockHash, BlockStatus]] = []
         for node in candidates:
@@ -157,11 +178,12 @@ class SIEVECachePolicy(CachePolicy):
         """Move the hand one step toward the head, wrapping to the tail."""
         if node.prev is not None:
             return node.prev
+        # Wrapped past the head; go back to the tail.
         assert self._tail is not None
         return self._tail
 
     def _unlink(self, node: _SieveNode) -> None:
-        """Remove node from the doubly-linked list, updating the hand."""
+        """Remove *node* from the doubly-linked list, updating the hand."""
         if self._hand is node:
             if node.prev is not None:
                 self._hand = node.prev
@@ -173,7 +195,10 @@ class SIEVECachePolicy(CachePolicy):
         self._unlink_no_hand(node)
 
     def _unlink_no_hand(self, node: _SieveNode) -> None:
-        """Remove node from the doubly-linked list without touching the hand."""
+        """Remove *node* from the doubly-linked list without touching the hand.
+
+        Used by evict() which manages the hand separately.
+        """
         if node.prev is not None:
             node.prev.next = node.next
         else:

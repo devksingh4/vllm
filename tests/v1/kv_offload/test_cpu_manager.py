@@ -624,6 +624,9 @@ def test_filter_reused_manager():
     manager.complete_store(to_hashes([1]))
 
 
+# ---- SIEVE-specific tests ----
+
+
 def test_sieve_manager_basic():
     """
     Tests CPUOffloadingManager with sieve policy.

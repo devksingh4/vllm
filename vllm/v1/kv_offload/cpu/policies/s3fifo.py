@@ -32,7 +32,7 @@ class S3FIFOCachePolicy(CachePolicy):
         self._m_capacity = cache_capacity - self._s_capacity
         self._ghost_capacity = cache_capacity
 
-        # S queue (insertion order = oldest to newest).
+        # S queue (insertion order = oldest to newest). Freq is implicitly 0.
         self._s_map: dict[BlockHash, BlockStatus] = {}
 
         # M queue (insertion order = oldest to newest).
@@ -91,7 +91,7 @@ class S3FIFOCachePolicy(CachePolicy):
         if n == 0:
             return []
 
-        # Pre-scan to guarantee atomicity (must find at least 'n' evictable blocks)
+        # 1. Pre-scan to guarantee atomicity (must find at least 'n' evictable blocks globally)
         scan_steps = 0
         evictable_count = 0
 
@@ -115,10 +115,10 @@ class S3FIFOCachePolicy(CachePolicy):
             self.stats.evict_failed += 1
             return None
 
-        # S3-FIFO decay loop
+        # 2. S3-FIFO decay loop
         result: list[tuple[BlockHash, BlockStatus]] = []
 
-        # Evict from S queue
+        # Phase A: Evict from S queue
         s_keys = list(self._s_map.keys())
         for bh in s_keys:
             if len(result) == n:
@@ -130,7 +130,7 @@ class S3FIFOCachePolicy(CachePolicy):
                 self._ghost[bh] = None
                 result.append((bh, block))
 
-        # Evict from M queue with multi-pass decay
+        # Phase B: Evict from M queue with multi-pass decay
         while len(result) < n:
             m_keys = list(self._m_map.keys())
             for bh in m_keys:
@@ -152,7 +152,7 @@ class S3FIFOCachePolicy(CachePolicy):
                         self._m_freq[bh] -= 1
                         self._m_map[bh] = self._m_map.pop(bh)
 
-        # Trim ghost to capacity
+        # 3. Trim ghost to capacity
         overflow = len(self._ghost) - self._ghost_capacity
         if overflow > 0:
             ghost_iter = iter(self._ghost)
