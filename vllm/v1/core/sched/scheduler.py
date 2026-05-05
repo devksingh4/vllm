@@ -1960,6 +1960,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_usage=self.kv_cache_manager.usage,
             encoder_cache_usage=self._get_encoder_cache_usage(),
             kv_cache_partition_block_refs=self.kv_cache_manager.block_pool.get_partition_block_ref_totals(),
+            eviction_policy_stats=self.kv_cache_manager.block_pool.get_eviction_policy_stats(),
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
