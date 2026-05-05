@@ -1575,3 +1575,335 @@ class LoRAPrefixTreePolicy(CachePolicy):
             self._detach(bh)
         self.stats.evict_blocks += len(result)
         return result
+
+
+# ---------------------------------------------------------------------------
+# Loose-style variants of group-eviction (tight) policies
+# ---------------------------------------------------------------------------
+#
+# Each of the policies below applies a tight-policy idea (hysteresis, decayed
+# frequency, ARC-style ghost lists) to the *protection set* rather than to
+# selection. The inner policy still picks blocks individually within the
+# unprotected set, preserving its scan-resistance and avoiding the
+# atomic-commit failure mode of group eviction.
+
+
+class LoRALooseHysteresisPolicy(CachePolicy):
+    """
+    Loose coupling with hysteresis on the live -> non-live transition.
+
+    Protects blocks of live adapters and of adapters that have left the
+    live set within the last ``hysteresis_steps`` updates.  Eviction
+    among the remaining (cold-non-live) blocks is delegated to the
+    inner policy.  Falls back to unrestricted eviction if the protected
+    set is too large.
+
+    Differs from :class:`LoRAHysteresisCouplingPolicy` (which group-evicts
+    on the selection side) by using the hysteresis window as a
+    protection-side filter.
+    """
+
+    def __init__(
+        self,
+        cache_capacity: int,
+        inner_cls: type[CachePolicy] | None = None,
+        hysteresis_steps: int = 20,
+    ) -> None:
+        if inner_cls is None:
+            from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+            inner_cls = LRUCachePolicy
+        self._inner: CachePolicy = inner_cls(cache_capacity)
+        self._book = _LoRABookkeeping()
+        self._hysteresis = hysteresis_steps
+        self._step = 0
+        # adapter_id -> step at which it last left the live set
+        self._left_live_at: dict[str, int] = {}
+        self.stats = PolicyStats()
+
+    def register_block_adapter(
+        self, block_hash: BlockHash, adapter_id: str | None
+    ) -> None:
+        self._book.register(block_hash, adapter_id)
+
+    def update_live_adapters(self, adapters: set[str]) -> None:
+        self._step += 1
+        new = set(adapters)
+        old = self._book.live_adapters
+        for aid in old - new:
+            self._left_live_at[aid] = self._step
+        for aid in new - old:
+            self._left_live_at.pop(aid, None)
+        self._book.update_live(new)
+
+    def get(self, block_hash: BlockHash) -> BlockStatus | None:
+        self.stats.get_calls += 1
+        return self._inner.get(block_hash)
+
+    def insert(self, block_hash: BlockHash, block: BlockStatus) -> None:
+        self.stats.insert_calls += 1
+        self._inner.insert(block_hash, block)
+
+    def remove(self, block_hash: BlockHash) -> None:
+        self.stats.remove_calls += 1
+        self._inner.remove(block_hash)
+        self._book.unregister(block_hash)
+
+    def touch(self, block_hashes: Iterable[BlockHash]) -> None:
+        self.stats.touch_calls += 1
+        bh_list = list(block_hashes)
+        self._inner.touch(bh_list)
+        self.stats.touch_blocks += len(bh_list)
+
+    def _protected_adapter_ids(self) -> set[str]:
+        protected = set(self._book.live_adapters)
+        for aid, step in self._left_live_at.items():
+            if self._step - step < self._hysteresis:
+                protected.add(aid)
+        return protected
+
+    def _protected_block_hashes(self) -> set[BlockHash]:
+        result: set[BlockHash] = set()
+        for aid in self._protected_adapter_ids():
+            blocks = self._book.adapter_to_blocks.get(aid)
+            if blocks:
+                result.update(blocks)
+        return result
+
+    def evict(
+        self, n: int, protected: set[BlockHash]
+    ) -> list[tuple[BlockHash, BlockStatus]] | None:
+        self.stats.evict_calls += 1
+        if n == 0:
+            return []
+
+        extended = protected | self._protected_block_hashes()
+        result = self._inner.evict(n, extended)
+        if result is not None:
+            for bh, _ in result:
+                self._book.unregister(bh)
+            self.stats.evict_blocks += len(result)
+            return result
+
+        # Fallback: unrestricted eviction.
+        result = self._inner.evict(n, protected)
+        if result is None:
+            self.stats.evict_failed += 1
+            return None
+        for bh, _ in result:
+            self._book.unregister(bh)
+        self.stats.evict_blocks += len(result)
+        return result
+
+
+class LoRALooseFrequencyPolicy(CachePolicy):
+    """
+    Loose coupling weighted by per-adapter access frequency.
+
+    Maintains a decayed heat score per adapter (incremented on every
+    block insertion and touch; decayed on each ``update_live_adapters``
+    call).  Protects blocks of live adapters and of non-live adapters
+    whose heat is at or above the median non-live heat.  The inner
+    policy is then allowed to evict from the colder half of non-live
+    adapters' blocks.  Falls back to unrestricted eviction if needed.
+
+    A continuous, protection-side analog to
+    :class:`LoRAFrequencyWeightedPolicy` (which uses heat to rank group
+    eviction victims).
+    """
+
+    def __init__(
+        self,
+        cache_capacity: int,
+        inner_cls: type[CachePolicy] | None = None,
+        decay: float = 0.9,
+    ) -> None:
+        if inner_cls is None:
+            from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+            inner_cls = LRUCachePolicy
+        self._inner: CachePolicy = inner_cls(cache_capacity)
+        self._book = _LoRABookkeeping()
+        self._decay = decay
+        self._heat: dict[str, float] = defaultdict(float)
+        self.stats = PolicyStats()
+
+    def register_block_adapter(
+        self, block_hash: BlockHash, adapter_id: str | None
+    ) -> None:
+        self._book.register(block_hash, adapter_id)
+        if adapter_id is not None:
+            self._heat[adapter_id] += 1.0
+
+    def update_live_adapters(self, adapters: set[str]) -> None:
+        self._book.update_live(adapters)
+        for aid in list(self._heat):
+            self._heat[aid] *= self._decay
+            if self._heat[aid] < 1e-6:
+                del self._heat[aid]
+
+    def get(self, block_hash: BlockHash) -> BlockStatus | None:
+        self.stats.get_calls += 1
+        return self._inner.get(block_hash)
+
+    def insert(self, block_hash: BlockHash, block: BlockStatus) -> None:
+        self.stats.insert_calls += 1
+        self._inner.insert(block_hash, block)
+
+    def remove(self, block_hash: BlockHash) -> None:
+        self.stats.remove_calls += 1
+        self._inner.remove(block_hash)
+        self._book.unregister(block_hash)
+
+    def touch(self, block_hashes: Iterable[BlockHash]) -> None:
+        self.stats.touch_calls += 1
+        bh_list = list(block_hashes)
+        self._inner.touch(bh_list)
+        for bh in bh_list:
+            aid = self._book.block_to_adapter.get(bh)
+            if aid is not None:
+                self._heat[aid] += 1.0
+        self.stats.touch_blocks += len(bh_list)
+
+    def _protected_block_hashes(self) -> set[BlockHash]:
+        protected_aids = set(self._book.live_adapters)
+        non_live_with_blocks = [
+            aid for aid in self._book.adapter_to_blocks
+            if aid not in self._book.live_adapters
+            and self._book.adapter_to_blocks[aid]
+        ]
+        if non_live_with_blocks:
+            heats = sorted(
+                self._heat.get(aid, 0.0) for aid in non_live_with_blocks
+            )
+            median = heats[len(heats) // 2]
+            for aid in non_live_with_blocks:
+                if self._heat.get(aid, 0.0) >= median:
+                    protected_aids.add(aid)
+        result: set[BlockHash] = set()
+        for aid in protected_aids:
+            blocks = self._book.adapter_to_blocks.get(aid)
+            if blocks:
+                result.update(blocks)
+        return result
+
+    def evict(
+        self, n: int, protected: set[BlockHash]
+    ) -> list[tuple[BlockHash, BlockStatus]] | None:
+        self.stats.evict_calls += 1
+        if n == 0:
+            return []
+
+        extended = protected | self._protected_block_hashes()
+        result = self._inner.evict(n, extended)
+        if result is not None:
+            for bh, _ in result:
+                self._book.unregister(bh)
+            self.stats.evict_blocks += len(result)
+            return result
+
+        result = self._inner.evict(n, protected)
+        if result is None:
+            self.stats.evict_failed += 1
+            return None
+        for bh, _ in result:
+            self._book.unregister(bh)
+        self.stats.evict_blocks += len(result)
+        return result
+
+
+class LoRALooseGhostPolicy(CachePolicy):
+    """
+    Loose coupling with ARC-style ghost-list re-entry boost.
+
+    Behaves like :class:`LoRALooseCouplingPolicy` on eviction (protect
+    live-adapter blocks, fall back to unrestricted).  Additionally,
+    when blocks are evicted their hashes are recorded in a bounded
+    ghost set; if those blocks are later re-inserted (via
+    ``register_block_adapter``), they are immediately ``touch()``-ed
+    in the inner policy so they land at MRU.
+
+    Cheaper than :class:`LoRAGhostListPolicy` because there is no
+    atomic-commit catastrophe to repair from -- the boost is a small
+    bonus on real reuse rather than a damage-control mechanism.
+    """
+
+    def __init__(
+        self,
+        cache_capacity: int,
+        inner_cls: type[CachePolicy] | None = None,
+        ghost_capacity_mult: float = 2.0,
+    ) -> None:
+        if inner_cls is None:
+            from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+            inner_cls = LRUCachePolicy
+        self._inner: CachePolicy = inner_cls(cache_capacity)
+        self._book = _LoRABookkeeping()
+        self._ghost: OrderedDict[BlockHash, str] = OrderedDict()
+        self._ghost_capacity = max(1, int(cache_capacity * ghost_capacity_mult))
+        self.stats = PolicyStats()
+
+    def register_block_adapter(
+        self, block_hash: BlockHash, adapter_id: str | None
+    ) -> None:
+        self._book.register(block_hash, adapter_id)
+        if block_hash in self._ghost:
+            del self._ghost[block_hash]
+            self._inner.touch([block_hash])
+
+    def update_live_adapters(self, adapters: set[str]) -> None:
+        self._book.update_live(adapters)
+
+    def get(self, block_hash: BlockHash) -> BlockStatus | None:
+        self.stats.get_calls += 1
+        return self._inner.get(block_hash)
+
+    def insert(self, block_hash: BlockHash, block: BlockStatus) -> None:
+        self.stats.insert_calls += 1
+        self._inner.insert(block_hash, block)
+
+    def remove(self, block_hash: BlockHash) -> None:
+        self.stats.remove_calls += 1
+        self._inner.remove(block_hash)
+        self._book.unregister(block_hash)
+
+    def touch(self, block_hashes: Iterable[BlockHash]) -> None:
+        self.stats.touch_calls += 1
+        bh_list = list(block_hashes)
+        self._inner.touch(bh_list)
+        self.stats.touch_blocks += len(bh_list)
+
+    def _add_to_ghost(self, block_hash: BlockHash, adapter_id: str) -> None:
+        self._ghost[block_hash] = adapter_id
+        while len(self._ghost) > self._ghost_capacity:
+            self._ghost.popitem(last=False)
+
+    def evict(
+        self, n: int, protected: set[BlockHash]
+    ) -> list[tuple[BlockHash, BlockStatus]] | None:
+        self.stats.evict_calls += 1
+        if n == 0:
+            return []
+
+        live_blocks = self._book.get_live_block_hashes()
+        extended_protected = protected | live_blocks
+
+        result = self._inner.evict(n, extended_protected)
+        if result is not None:
+            for bh, _ in result:
+                aid = self._book.block_to_adapter.get(bh)
+                self._book.unregister(bh)
+                if aid is not None:
+                    self._add_to_ghost(bh, aid)
+            self.stats.evict_blocks += len(result)
+            return result
+
+        result = self._inner.evict(n, protected)
+        if result is None:
+            self.stats.evict_failed += 1
+            return None
+        for bh, _ in result:
+            aid = self._book.block_to_adapter.get(bh)
+            self._book.unregister(bh)
+            if aid is not None:
+                self._add_to_ghost(bh, aid)
+        self.stats.evict_blocks += len(result)
+        return result

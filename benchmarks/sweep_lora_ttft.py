@@ -36,6 +36,9 @@ LORA_COUPLINGS = [
     "lora_ghost",
     "lora_position",
     "lora_prefixtree",
+    "lora_loose_hysteresis",
+    "lora_loose_freq",
+    "lora_loose_ghost",
 ]
 INNER_BASES = ["lru", "sieve", "s3fifo", "tinylfu", "lru_k"]
 

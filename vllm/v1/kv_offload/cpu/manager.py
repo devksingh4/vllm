@@ -25,6 +25,9 @@ from vllm.v1.kv_offload.cpu.policies.lora_aware import (
     LoRAGhostListPolicy,
     LoRAHysteresisCouplingPolicy,
     LoRALooseCouplingPolicy,
+    LoRALooseFrequencyPolicy,
+    LoRALooseGhostPolicy,
+    LoRALooseHysteresisPolicy,
     LoRAPositionAwarePolicy,
     LoRAPrefixTreePolicy,
     LoRASoftBoostCouplingPolicy,
@@ -64,6 +67,9 @@ _LORA_COUPLING_MODES: dict[str, type] = {
     "lora_ghost": LoRAGhostListPolicy,
     "lora_position": LoRAPositionAwarePolicy,
     "lora_prefixtree": LoRAPrefixTreePolicy,
+    "lora_loose_hysteresis": LoRALooseHysteresisPolicy,
+    "lora_loose_freq": LoRALooseFrequencyPolicy,
+    "lora_loose_ghost": LoRALooseGhostPolicy,
 }
 
 # Flat registry: base policies + all lora coupling combinations
