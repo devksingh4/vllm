@@ -181,6 +181,10 @@ class SchedulerStats:
     kv_cache_usage: float = 0.0
     encoder_cache_usage: float = 0.0
 
+    # Sum of ref_cnt contributions attributed to each cache_partition_id on
+    # the primary GPU KV block pool (metrics only; same pool as kv_cache_usage).
+    kv_cache_partition_block_refs: dict[str, int] = field(default_factory=dict)
+
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None
 

@@ -8,7 +8,10 @@ from pydantic import Field, SkipValidation, field_validator, model_validator
 
 from vllm.config.utils import config
 from vllm.logger import init_logger
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.torch_utils import (
+    is_quantized_kv_cache,
+    kv_cache_uses_per_token_head_scales,
+)
 
 logger = init_logger(__name__)
 
@@ -21,6 +24,8 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "int8_per_token_head",
+    "fp8_per_token_head",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -163,6 +168,16 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    kv_cache_partition_ref_caps: dict[str, int] | None = None
+    """Experimental two-level multi-model sharing: max ref-count contributions
+    per ``cache_partition_id`` on the GPU block pool. See
+    :mod:`vllm.v1.cache_partition` and :class:`~vllm.v1.core.block_pool.BlockPool`.
+    """
+    kv_cache_partition_eviction_cost: dict[str, float] | None = None
+    """Experimental single-level sharing: relative prefill cost multipliers per
+    partition for cost-aware LRU eviction (LRU base policy only).
+    """
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -192,6 +207,9 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # Experimental multi-model KV sharing (runtime policy only)
+            "kv_cache_partition_ref_caps",
+            "kv_cache_partition_eviction_cost",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -237,12 +255,20 @@ class CacheConfig:
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
-        if is_quantized_kv_cache(cache_dtype):
+        if kv_cache_uses_per_token_head_scales(cache_dtype):
             logger.info(
-                "Using fp8 data type to store kv cache. It reduces the GPU "
+                "Using %s data type to store kv cache. It reduces the GPU "
+                "memory footprint and boosts the performance. "
+                "Dynamic per-token-head scales will be computed at runtime.",
+                str(cache_dtype),
+            )
+        elif is_quantized_kv_cache(cache_dtype):
+            logger.info(
+                "Using %s data type to store kv cache. It reduces the GPU "
                 "memory footprint and boosts the performance. "
                 "Meanwhile, it may cause accuracy drop without a proper "
-                "scaling factor."
+                "scaling factor",
+                str(cache_dtype),
             )
         return cache_dtype
 

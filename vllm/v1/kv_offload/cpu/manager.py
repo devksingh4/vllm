@@ -3,7 +3,9 @@
 import atexit
 import os
 from collections.abc import Iterable
+from typing import Literal, cast
 
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
     LoadStoreSpec,

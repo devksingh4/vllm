@@ -73,6 +73,7 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        cache_partition_id: str | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -80,6 +81,9 @@ class Request:
         self.sampling_params = sampling_params
         self.pooling_params = pooling_params
         self.lora_request = lora_request
+        self.cache_partition_id = (
+            cache_partition_id if cache_partition_id is not None else ""
+        )
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
         )
@@ -181,7 +185,13 @@ class Request:
         cls,
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
+        *,
+        default_cache_partition_id: str | None = None,
     ) -> "Request":
+        cache_partition_id = request.cache_partition_id
+        if cache_partition_id is None:
+            cache_partition_id = default_cache_partition_id or ""
+
         return cls(
             request_id=request.request_id,
             client_index=request.client_index,
@@ -198,6 +208,7 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            cache_partition_id=cache_partition_id,
         )
 
     def append_output_token_ids(

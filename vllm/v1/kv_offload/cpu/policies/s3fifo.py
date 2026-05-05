@@ -23,8 +23,7 @@ _MAX_FREQ: int = 3
 
 class S3FIFOCachePolicy(CachePolicy):
     """
-    S3-FIFO cache eviction policy using Python dicts for native C-level FIFO ordering,
-    eliminating DLL overhead and double-scans.
+    S3-FIFO cache eviction policy
     """
 
     def __init__(self, cache_capacity: int) -> None:
@@ -69,7 +68,9 @@ class S3FIFOCachePolicy(CachePolicy):
     def touch(self, block_hashes: Iterable[BlockHash]) -> None:
         self.stats.touch_calls += 1
         count = 0
-        for bh in block_hashes:
+        # Process in reverse so that after all promotions the head block
+        # (index 0) is the last inserted into _m_map and therefore the newest
+        for bh in reversed(list(block_hashes)):
             if bh in self._m_map:
                 if self._m_freq[bh] < _MAX_FREQ:
                     self._m_freq[bh] += 1
