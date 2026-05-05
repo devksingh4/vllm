@@ -168,6 +168,16 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    kv_cache_partition_ref_caps: dict[str, int] | None = None
+    """Experimental two-level multi-model sharing: max ref-count contributions
+    per ``cache_partition_id`` on the GPU block pool. See
+    :mod:`vllm.v1.cache_partition` and :class:`~vllm.v1.core.block_pool.BlockPool`.
+    """
+    kv_cache_partition_eviction_cost: dict[str, float] | None = None
+    """Experimental single-level sharing: relative prefill cost multipliers per
+    partition for cost-aware LRU eviction (LRU base policy only).
+    """
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -197,6 +207,9 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # Experimental multi-model KV sharing (runtime policy only)
+            "kv_cache_partition_ref_caps",
+            "kv_cache_partition_eviction_cost",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

@@ -28,9 +28,13 @@ from vllm.tasks import GENERATION_TASKS, POOLING_TASKS, SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.jsontree import json_iter_leaves
+from vllm.config.model import get_served_model_name
+from vllm.v1.cache_partition import CACHE_PARTITION_ID_EXTRA_ARG
 from vllm.v1.engine import EngineCoreRequest
 
 logger = init_logger(__name__)
+
+_MAX_CACHE_PARTITION_ID_LEN = 256
 
 
 class InputProcessor:
@@ -171,6 +175,40 @@ class InputProcessor:
         ):
             return mm_hash
         return f"{lora_request.lora_name}:{mm_hash}"
+
+    def _resolve_cache_partition_id(
+        self,
+        params: SamplingParams | PoolingParams,
+    ) -> str:
+        """Resolve cache partition from request metadata or served model name."""
+        raw: Any | None = None
+        if isinstance(params, SamplingParams):
+            if params.extra_args is not None:
+                raw = params.extra_args.get(CACHE_PARTITION_ID_EXTRA_ARG)
+        elif params.extra_kwargs is not None:
+            raw = params.extra_kwargs.get(CACHE_PARTITION_ID_EXTRA_ARG)
+
+        if raw is not None:
+            if not isinstance(raw, str):
+                raise ValueError(
+                    f"{CACHE_PARTITION_ID_EXTRA_ARG!r} must be a string, "
+                    f"got {type(raw).__name__}"
+                )
+            stripped = raw.strip()
+            if not stripped:
+                raise ValueError(
+                    f"{CACHE_PARTITION_ID_EXTRA_ARG!r} must be a non-empty string "
+                    "after stripping whitespace"
+                )
+            if len(stripped) > _MAX_CACHE_PARTITION_ID_LEN:
+                raise ValueError(
+                    f"{CACHE_PARTITION_ID_EXTRA_ARG!r} exceeds maximum length "
+                    f"({_MAX_CACHE_PARTITION_ID_LEN})"
+                )
+            return stripped
+
+        mc = self.model_config
+        return get_served_model_name(mc.model, mc.served_model_name)
 
     @staticmethod
     def assign_request_id(request: EngineCoreRequest):
@@ -318,6 +356,8 @@ class InputProcessor:
                     )
                 )
 
+        cache_partition_id = self._resolve_cache_partition_id(params)
+
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
@@ -332,6 +372,7 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            cache_partition_id=cache_partition_id,
         )
 
     def _validate_prompt_len(
