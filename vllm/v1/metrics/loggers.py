@@ -263,6 +263,15 @@ class LoggingStatLogger(StatLoggerBase):
                 ", ".join(f"{k}={v}" for k, v in sorted(part_refs.items()))
             )
 
+        ep_stats = self.last_scheduler_stats.eviction_policy_stats
+        if ep_stats:
+            ep_hits = int(ep_stats.get("hits", 0))
+            ep_evicts = int(ep_stats.get("evicts", 0))
+            ep_total = ep_hits + ep_evicts
+            ep_rate = (ep_hits / ep_total * 100) if ep_total > 0 else 0.0
+            log_parts.append("Policy [%s] block hit rate: %.1f%% (%d/%d)")
+            log_args.extend([ep_stats.get("name", "?"), ep_rate, ep_hits, ep_total])
+
         log_fn(
             self.log_prefix + ", ".join(log_parts),
             *log_args,

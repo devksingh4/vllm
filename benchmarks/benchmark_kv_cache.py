@@ -546,15 +546,15 @@ def create_parser() -> FlexibleArgumentParser:
         "--workload",
         choices=["uniform", "zipfian", "temporal", "scan-resistant", "helm",
                  "multi-partition"],
-        default="scan-resistant",
+        default="zipfian",
         help="Workload pattern (default: scan-resistant)",
     )
 
     # Synthetic workload params
-    p.add_argument("--num-batches", type=int, default=2)
-    p.add_argument("--batch-size", type=int, default=96)
-    p.add_argument("--prefix-words", type=int, default=2000)
-    p.add_argument("--suffix-words", type=int, default=20)
+    p.add_argument("--num-batches", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--prefix-words", type=int, default=3000)
+    p.add_argument("--suffix-words", type=int, default=30)
     p.add_argument("--max-tokens", type=int, default=196)
     p.add_argument("--num-prefixes", type=int, default=80)
     p.add_argument("--zipfian-alpha", type=float, default=1.5)

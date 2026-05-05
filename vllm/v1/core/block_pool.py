@@ -215,6 +215,18 @@ class BlockPool:
             gpu_policy = "lru"
             self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
         logger.info("GPU KV cache eviction policy: %s", gpu_policy)
+        self._gpu_policy_name = gpu_policy
+
+        # Block-level counters for the chosen GPU eviction policy:
+        #   _policy_hit_blocks   — blocks reclaimed from the free queue via
+        #                          touch() before the policy could evict them
+        #   _policy_evict_blocks — blocks the policy chose to evict that were
+        #                          still in the prefix cache (hash-having)
+        # Hit rate = hits / (hits + evicts) is the apples-to-apples cross-policy
+        # measurement: it counts only block-level decisions the policy actually
+        # made, not preemption-inflated token re-queries.
+        self._policy_hit_blocks: int = 0
+        self._policy_evict_blocks: int = 0
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -237,6 +249,14 @@ class BlockPool:
     def get_partition_block_ref_totals(self) -> dict[str, int]:
         """Snapshot of ref_cnt contributions attributed to each cache partition."""
         return dict(self._partition_block_ref_totals)
+
+    def get_eviction_policy_stats(self) -> dict[str, int | str]:
+        """Cumulative block-level hit/evict counters for the GPU eviction policy."""
+        return {
+            "name": self._gpu_policy_name,
+            "hits": self._policy_hit_blocks,
+            "evicts": self._policy_evict_blocks,
+        }
 
     def set_partition_ref_caps(self, caps: dict[str, int] | None) -> None:
         """Dynamic two-level budgets: max ref-count contributions per partition.
@@ -499,6 +519,9 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        # Block was actually cached and is now being evicted by the policy.
+        self._policy_evict_blocks += 1
+
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -529,6 +552,7 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                self._policy_hit_blocks += 1
             block.ref_cnt += 1
             self._partition_note_ref(block, cache_partition_id, 1)
             self._note_block_partition_activity(block, cache_partition_id)
