@@ -5,7 +5,7 @@
 import copy
 import hashlib
 import os
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
@@ -750,6 +750,199 @@ class SIEVEFreeBlockQueue:
                 return block
 
         raise RuntimeError("SIEVE: failed to find eviction candidate")
+
+
+class TinyLFUFreeBlockQueue:
+    """W-TinyLFU free block queue for GPU KV cache eviction.
+
+    Drop-in replacement for FreeKVCacheBlockQueue using the W-TinyLFU
+    algorithm (Einziger et al., EuroSys 2014; Caffeine variant) instead
+    of LRU.
+
+    Three LRU segments tracked as OrderedDicts keyed by ``block_id``:
+    - ``window``  — newly returned blocks land here.
+    - ``probation`` — blocks that won an admission contest from window.
+    - ``protected`` — proven hot blocks (re-touched while in probation).
+
+    A count-min sketch approximates per-block touch frequency. When a
+    touched window block returns to the free list, its frequency is
+    contested against probation's LRU; the winner takes probation's
+    slot. Eviction order is probation → window → protected (coldest
+    first), each LRU within its segment.
+    """
+
+    _SKETCH_DEPTH: int = 4
+
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        window_fraction: float = 0.01,
+        protected_fraction: float = 0.8,
+        sketch_width_mult: int = 4,
+        age_threshold_mult: int = 10,
+    ) -> None:
+        n = len(blocks)
+        self.num_free_blocks = n
+        cap = max(1, n)
+        self._window_cap = max(1, int(cap * window_fraction))
+        main_cap = max(1, cap - self._window_cap)
+        self._protected_cap = max(1, int(main_cap * protected_fraction))
+        self._probation_cap = max(1, main_cap - self._protected_cap)
+
+        self._window: OrderedDict[int, KVCacheBlock] = OrderedDict()
+        self._probation: OrderedDict[int, KVCacheBlock] = OrderedDict()
+        self._protected: OrderedDict[int, KVCacheBlock] = OrderedDict()
+
+        # Last segment a block was in (preserved across remove/append
+        # so a touched return can promote correctly).
+        self._last_segment: dict[int, str] = {}
+        # Block IDs that received a remove() (prefix cache hit) and have
+        # not yet been re-appended.
+        self._touched: set[int] = set()
+
+        # Count-min sketch keyed by block_id.
+        self._sketch_width = max(64, cap * sketch_width_mult)
+        self._sketch: list[list[int]] = [
+            [0] * self._sketch_width for _ in range(self._SKETCH_DEPTH)
+        ]
+        self._sketch_seeds = [
+            0x9E3779B1 * (i + 1) for i in range(self._SKETCH_DEPTH)
+        ]
+        self._sketch_sum = 0
+        self._age_threshold = age_threshold_mult * cap
+
+        for block in blocks:
+            self._window[block.block_id] = block
+            self._last_segment[block.block_id] = "window"
+
+    # --- sketch ---
+
+    def _row_indices(self, bid: int) -> list[int]:
+        return [(bid ^ s) % self._sketch_width for s in self._sketch_seeds]
+
+    def _sketch_increment(self, bid: int) -> None:
+        for row, col in enumerate(self._row_indices(bid)):
+            self._sketch[row][col] += 1
+        self._sketch_sum += 1
+        if self._sketch_sum >= self._age_threshold:
+            for row in range(self._SKETCH_DEPTH):
+                self._sketch[row] = [c >> 1 for c in self._sketch[row]]
+            self._sketch_sum >>= 1
+
+    def _sketch_estimate(self, bid: int) -> int:
+        return min(
+            self._sketch[row][col]
+            for row, col in enumerate(self._row_indices(bid))
+        )
+
+    # --- queue interface ---
+
+    def popleft(self) -> KVCacheBlock:
+        if self.num_free_blocks == 0:
+            raise ValueError("No free blocks available")
+        block = self._evict_one()
+        self.num_free_blocks -= 1
+        block.prev_free_block = block.next_free_block = None
+        return block
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+        result: list[KVCacheBlock] = []
+        for _ in range(n):
+            block = self._evict_one()
+            block.prev_free_block = block.next_free_block = None
+            result.append(block)
+        self.num_free_blocks -= n
+        return result
+
+    def remove(self, block: KVCacheBlock) -> None:
+        """Remove a block from the free queue (prefix cache hit)."""
+        bid = block.block_id
+        if bid in self._window:
+            del self._window[bid]
+            seg = "window"
+        elif bid in self._probation:
+            del self._probation[bid]
+            seg = "probation"
+        elif bid in self._protected:
+            del self._protected[bid]
+            seg = "protected"
+        else:
+            seg = self._last_segment.get(bid, "window")
+        self._last_segment[bid] = seg
+        self._sketch_increment(bid)
+        self._touched.add(bid)
+        block.prev_free_block = block.next_free_block = None
+        self.num_free_blocks -= 1
+
+    def append(self, block: KVCacheBlock) -> None:
+        """Return a block to the free queue."""
+        bid = block.block_id
+        if bid in self._touched:
+            self._touched.discard(bid)
+            last = self._last_segment.get(bid, "window")
+            if last in ("protected", "probation"):
+                # A re-touched probation/protected block lands in protected.
+                self._protected[bid] = block
+                self._last_segment[bid] = "protected"
+                self._enforce_protected_cap()
+            else:
+                # Touched window block contests admission to probation.
+                self._maybe_admit_to_probation(bid, block)
+        else:
+            # Untouched return (or first-time entry): goes to window MRU.
+            self._window[bid] = block
+            self._last_segment[bid] = "window"
+        self.num_free_blocks += 1
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        for block in blocks:
+            self.append(block)
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        # Coldest segment first, matching eviction order.
+        return (
+            list(self._probation.values())
+            + list(self._window.values())
+            + list(self._protected.values())
+        )
+
+    # --- internals ---
+
+    def _enforce_protected_cap(self) -> None:
+        while len(self._protected) > self._protected_cap:
+            d_bid, d_block = self._protected.popitem(last=False)
+            self._probation[d_bid] = d_block
+            self._last_segment[d_bid] = "probation"
+
+    def _maybe_admit_to_probation(
+        self, bid: int, block: KVCacheBlock
+    ) -> None:
+        if len(self._probation) < self._probation_cap:
+            self._probation[bid] = block
+            self._last_segment[bid] = "probation"
+            return
+        victim_bid = next(iter(self._probation))
+        if self._sketch_estimate(bid) > self._sketch_estimate(victim_bid):
+            victim_block = self._probation.pop(victim_bid)
+            self._probation[bid] = block
+            self._last_segment[bid] = "probation"
+            self._window[victim_bid] = victim_block
+            self._last_segment[victim_bid] = "window"
+        else:
+            self._window[bid] = block
+            self._last_segment[bid] = "window"
+
+    def _evict_one(self) -> KVCacheBlock:
+        for storage in (self._probation, self._window, self._protected):
+            if storage:
+                bid, block = storage.popitem(last=False)
+                self._last_segment.pop(bid, None)
+                self._touched.discard(bid)
+                return block
+        raise RuntimeError("TinyLFU: no free blocks to evict")
 
 
 def need_extra_keys(request: Request) -> bool:

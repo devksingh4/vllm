@@ -25,6 +25,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     S3FIFOFreeBlockQueue,
     SIEVEFreeBlockQueue,
+    TinyLFUFreeBlockQueue,
     generate_block_hash_extra_keys,
     get_block_hash,
     make_block_hash_with_group_id,
@@ -180,7 +181,7 @@ class BlockPool:
         gpu_policy = (envs.VLLM_KV_OFFLOAD_POLICY or "").lower()
         use_cost_queue = (
             self._partition_eviction_cost is not None
-            and gpu_policy not in ("s3fifo", "sieve")
+            and gpu_policy not in ("s3fifo", "sieve", "tinylfu")
         )
         if use_cost_queue:
             cost_map = self._partition_eviction_cost
@@ -202,7 +203,10 @@ class BlockPool:
                     "is s3fifo (VLLM_KV_OFFLOAD_POLICY)."
                 )
             self.free_block_queue: (
-                FreeKVCacheBlockQueue | S3FIFOFreeBlockQueue | SIEVEFreeBlockQueue
+                FreeKVCacheBlockQueue
+                | S3FIFOFreeBlockQueue
+                | SIEVEFreeBlockQueue
+                | TinyLFUFreeBlockQueue
             ) = S3FIFOFreeBlockQueue(self.blocks)
         elif gpu_policy == "sieve":
             if self._partition_eviction_cost is not None:
@@ -211,6 +215,13 @@ class BlockPool:
                     "is sieve (VLLM_KV_OFFLOAD_POLICY)."
                 )
             self.free_block_queue = SIEVEFreeBlockQueue(self.blocks)
+        elif gpu_policy == "tinylfu":
+            if self._partition_eviction_cost is not None:
+                logger.warning(
+                    "partition_eviction_cost is ignored when GPU eviction policy "
+                    "is tinylfu (VLLM_KV_OFFLOAD_POLICY)."
+                )
+            self.free_block_queue = TinyLFUFreeBlockQueue(self.blocks)
         else:
             gpu_policy = "lru"
             self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)

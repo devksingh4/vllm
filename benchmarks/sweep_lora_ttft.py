@@ -163,6 +163,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--outdir", default="/tmp/lora_sweep_logs/ttft_sweep")
     p.add_argument("--timeout-s", type=int, default=300)
+    p.add_argument(
+        "--policies",
+        default=None,
+        help="Comma-separated subset of ALL_POLICIES to run.",
+    )
     return p.parse_args()
 
 
@@ -180,7 +185,16 @@ def main() -> None:
         except Exception as e:
             print(f"[warn] could not load existing results: {e}")
 
-    plan = [(p, s) for p in ALL_POLICIES for s in SCENARIOS]
+    if args.policies:
+        wanted = [x.strip() for x in args.policies.split(",") if x.strip()]
+        unknown = [x for x in wanted if x not in ALL_POLICIES]
+        if unknown:
+            print(f"[error] unknown policies: {unknown}", file=sys.stderr)
+            sys.exit(2)
+        policies = wanted
+    else:
+        policies = ALL_POLICIES
+    plan = [(p, s) for p in policies for s in SCENARIOS]
     print(
         f"TTFT Sweep: {len(plan)} runs total ({len(plan) - len(done)} "
         f"remaining, {len(done)} cached). Out: {outdir}",
