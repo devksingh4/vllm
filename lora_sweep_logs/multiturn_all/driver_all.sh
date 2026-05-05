@@ -2,20 +2,21 @@
 # Multi-turn benchmark sweep across all LoRA coupling modes × {lru, sieve, s3fifo}.
 # 3 base policies + 15 couplings × 3 inner bases = 48 runs.
 set -u
-cd /home/dsingh/source/devksingh4/vllm
+cd /home/dsingh14/vllm
 
-OUTDIR=/home/dsingh/source/devksingh4/vllm/lora_sweep_logs/multiturn_all
+OUTDIR=/home/dsingh14/vllm/lora_sweep_logs/multiturn_all
 mkdir -p "$OUTDIR"
 
 PY=.venv/bin/python
 BENCH=benchmarks/benchmark_lora_ttft.py
 
 COMMON=(
-  --model Qwen/Qwen2.5-1.5B
-  --lora-path kaitchup/Qwen2.5-1.5B-oasst-guanaco-LoRA-adapter
+  --model Qwen/Qwen3-8B
+  --lora-path maydixit/qwen3-8b-lora-self-preservation-rl
   --num-adapters 16
   --max-loras 2
   --max-cpu-loras 16
+  --max-lora-rank 32
   --scenario multi_turn
   --num-requests 1280
   --batch-size 128
@@ -28,8 +29,8 @@ COMMON=(
   --zipfian-alpha 1.2
   --max-tokens 8
   --max-model-len 8192
-  --gpu-memory-utilization 0.5
-  --kv-offloading-size 0.5
+  # --gpu-memory-utilization 0.31
+  # --kv-offloading-size 0.5
 )
 
 BASES=(lru sieve s3fifo)
