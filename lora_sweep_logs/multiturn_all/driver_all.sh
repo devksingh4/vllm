@@ -35,25 +35,25 @@ COMMON=(
 
 BASES=(lru sieve s3fifo)
 COUPLINGS=(
-  lora_tight
-  lora_loose
-  lora_hysteresis
+  lora_budget
   lora_soft
+  lora_loose
+  lora_position
+  lora_loose_hysteresis
+  lora_loose_ghost
+  lora_loose_freq
+  lora_tight
+  lora_hysteresis
   lora_freqweighted
   lora_correlated
-  lora_budget
   lora_adabudget
   lora_costaware
   lora_ghost
-  lora_position
   lora_prefixtree
-  lora_loose_hysteresis
-  lora_loose_freq
-  lora_loose_ghost
 )
 
 POLICIES=()
-for b in "${BASES[@]}"; do POLICIES+=("$b"); done
+# for b in "${BASES[@]}"; do POLICIES+=("$b"); done
 for c in "${COUPLINGS[@]}"; do
   for b in "${BASES[@]}"; do POLICIES+=("${c}:${b}"); done
 done
