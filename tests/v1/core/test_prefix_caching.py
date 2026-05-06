@@ -87,6 +87,7 @@ def make_request(
         lora_request=lora_request,
         cache_salt=cache_salt,
         block_hasher=get_request_block_hasher(block_size, hash_fn),
+        cache_partition_id="test-partition",
     )
 
 
@@ -1989,7 +1990,7 @@ def test_null_parent_block_hash():
     # Physical parent is `null_block` (no hash), while the logical parent hash
     # still exists in `request.block_hashes[num_cached_blocks - 1]`.
     assert pool.null_block.block_hash is None
-    new_blocks = pool.get_new_blocks(num_full_blocks - 1)
+    new_blocks = pool.get_new_blocks(num_full_blocks - 1, "test-partition")
     blocks = [
         new_blocks[: num_cached_blocks - 1],
         pool.null_block,  # physical parent

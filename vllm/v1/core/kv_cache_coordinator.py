@@ -41,6 +41,8 @@ class KVCacheCoordinator(ABC):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        partition_ref_caps: dict[str, int] | None = None,
+        partition_eviction_cost: dict[str, float] | None = None,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -52,6 +54,8 @@ class KVCacheCoordinator(ABC):
             hash_block_size,
             enable_kv_cache_events,
             metrics_collector,
+            partition_ref_caps=partition_ref_caps,
+            partition_eviction_cost=partition_eviction_cost,
         )
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
@@ -120,6 +124,7 @@ class KVCacheCoordinator(ABC):
         new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        cache_partition_id: str,
     ) -> None:
         """
         Add the new computed blocks to the request. Optionally allocate new
@@ -138,6 +143,7 @@ class KVCacheCoordinator(ABC):
                 new_computed_blocks[i],
                 num_local_computed_tokens,
                 num_external_computed_tokens,
+                cache_partition_id,
             )
 
     def allocate_new_blocks(
@@ -145,6 +151,7 @@ class KVCacheCoordinator(ABC):
         request_id: str,
         num_tokens: int,
         num_tokens_main_model: int,
+        cache_partition_id: str,
         num_encoder_tokens: int = 0,
     ) -> tuple[list[KVCacheBlock], ...]:
         """
@@ -171,6 +178,7 @@ class KVCacheCoordinator(ABC):
                 if isinstance(manager, CrossAttentionManager)
                 else num_tokens,
                 num_tokens_main_model,
+                cache_partition_id,
             )
             for manager in self.single_type_managers
         )
@@ -188,15 +196,16 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.cache_blocks(request, num_computed_tokens)
 
-    def free(self, request_id: str) -> None:
+    def free(self, request_id: str, cache_partition_id: str) -> None:
         """
         Free the blocks for the request.
 
         Args:
             request_id: The request ID.
+            cache_partition_id: Logical partition releasing these refs (metrics).
         """
         for manager in self.single_type_managers:
-            manager.free(request_id)
+            manager.free(request_id, cache_partition_id)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
@@ -216,7 +225,10 @@ class KVCacheCoordinator(ABC):
         ]
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        cache_partition_id: str,
     ) -> None:
         """
         Remove the blocks that are no longer needed from `blocks` and replace
@@ -226,9 +238,12 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
             total_computed_tokens: The total number of computed tokens, including
                 local computed tokens and external computed tokens.
+            cache_partition_id: Logical partition for freed refs (metrics).
         """
         for manager in self.single_type_managers:
-            manager.remove_skipped_blocks(request_id, total_computed_tokens)
+            manager.remove_skipped_blocks(
+                request_id, total_computed_tokens, cache_partition_id
+            )
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
@@ -271,6 +286,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        partition_ref_caps: dict[str, int] | None = None,
+        partition_eviction_cost: dict[str, float] | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -282,6 +299,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            partition_ref_caps=partition_ref_caps,
+            partition_eviction_cost=partition_eviction_cost,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -317,6 +336,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        partition_ref_caps: dict[str, int] | None = None,
+        partition_eviction_cost: dict[str, float] | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -328,6 +349,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            partition_ref_caps=partition_ref_caps,
+            partition_eviction_cost=partition_eviction_cost,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -382,6 +405,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        partition_ref_caps: dict[str, int] | None = None,
+        partition_eviction_cost: dict[str, float] | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -393,6 +418,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            partition_ref_caps=partition_ref_caps,
+            partition_eviction_cost=partition_eviction_cost,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -554,6 +581,8 @@ def get_kv_cache_coordinator(
     pcp_world_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
+    partition_ref_caps: dict[str, int] | None = None,
+    partition_eviction_cost: dict[str, float] | None = None,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -565,6 +594,8 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            partition_ref_caps=partition_ref_caps,
+            partition_eviction_cost=partition_eviction_cost,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -577,6 +608,8 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            partition_ref_caps=partition_ref_caps,
+            partition_eviction_cost=partition_eviction_cost,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -588,4 +621,6 @@ def get_kv_cache_coordinator(
         pcp_world_size=pcp_world_size,
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
+        partition_ref_caps=partition_ref_caps,
+        partition_eviction_cost=partition_eviction_cost,
     )

@@ -18,6 +18,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.utils.hashing import sha256
+from vllm.v1.cache_partition import KV_CACHE_INTERNAL_PARTITION_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
@@ -175,6 +176,8 @@ def make_scheduler(
 
 _req_counter = 0
 
+OFFLOAD_TEST_CACHE_PARTITION_ID = "test-offload-partition"
+
 
 def make_request(
     num_blocks: int = 2,
@@ -198,6 +201,7 @@ def make_request(
         pooling_params=None,
         mm_features=None,
         block_hasher=get_request_block_hasher(BLOCK_SIZE, sha256),
+        cache_partition_id=OFFLOAD_TEST_CACHE_PARTITION_ID,
     )
     return req
 
@@ -305,7 +309,7 @@ def _allocate_gpu_blocks(
     register them in the prefix cache via cache_full_blocks so that
     re-allocation properly evicts stale hashes.
     """
-    blocks = gpu_block_pool.get_new_blocks(num_blocks)
+    blocks = gpu_block_pool.get_new_blocks(num_blocks, request.cache_partition_id)
     num_full = min(num_blocks, len(request.block_hashes))
     if num_full > 0:
         gpu_block_pool.cache_full_blocks(
@@ -378,12 +382,15 @@ def test_eager_store_and_load_roundtrip() -> None:
         pooling_params=None,
         mm_features=None,
         block_hasher=req._block_hasher,
+        cache_partition_id=OFFLOAD_TEST_CACHE_PARTITION_ID,
     )
     hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
     assert hit_tokens == num_blocks * BLOCK_SIZE
     assert is_async is True
 
-    gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(num_blocks)
+    gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(
+        num_blocks, req2.cache_partition_id
+    )
     kv_blocks2 = KVCacheBlocks(blocks=(gpu_blocks2,))
     sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
 
@@ -414,7 +421,9 @@ def _flush_old_blocks_to_lru_head(
     head, consuming the unhashed blocks and leaving the old hashed blocks at
     the front of the queue.
     """
-    fillers = gpu_pool.get_new_blocks(num_filler_blocks)
+    fillers = gpu_pool.get_new_blocks(
+        num_filler_blocks, KV_CACHE_INTERNAL_PARTITION_ID
+    )
     return fillers
 
 
@@ -435,7 +444,7 @@ def test_lazy_store_and_load_roundtrip() -> None:
     # --- Step 1: Schedule req_old, compute, and finish ---
     req_old = make_request(num_blocks=num_blocks)
     gpu_blocks_old = _allocate_gpu_blocks(gpu_pool, req_old, num_blocks, group_id=0)
-    gpu_pool.free_blocks(gpu_blocks_old)
+    gpu_pool.free_blocks(gpu_blocks_old, req_old.cache_partition_id)
 
     # Allocate filler blocks so req_old's hashed blocks move to LRU head.
     # 7 usable - 2 (req_old freed) = 5 other free blocks to consume.
@@ -449,7 +458,7 @@ def test_lazy_store_and_load_roundtrip() -> None:
     simulate_store_completion(sched, meta.store_event)
 
     # Free fillers to restore pool capacity.
-    gpu_pool.free_blocks(fillers)
+    gpu_pool.free_blocks(fillers, KV_CACHE_INTERNAL_PARTITION_ID)
 
     # --- Step 3: Re-schedule req_old — should get CPU cache hit ---
     req_old2 = Request(
@@ -459,6 +468,7 @@ def test_lazy_store_and_load_roundtrip() -> None:
         pooling_params=None,
         mm_features=None,
         block_hasher=req_old._block_hasher,
+        cache_partition_id=OFFLOAD_TEST_CACHE_PARTITION_ID,
     )
     hit_tokens, is_async = sched.get_num_new_matched_tokens(
         req_old2, num_computed_tokens=0
@@ -469,7 +479,9 @@ def test_lazy_store_and_load_roundtrip() -> None:
     assert is_async is True
 
     # Allocate fresh GPU blocks for the load.
-    gpu_blocks_load = gpu_pool.get_new_blocks(num_blocks)
+    gpu_blocks_load = gpu_pool.get_new_blocks(
+        num_blocks, req_old2.cache_partition_id
+    )
     kv_blocks_load = KVCacheBlocks(blocks=(gpu_blocks_load,))
     sched.update_state_after_alloc(
         req_old2, kv_blocks_load, num_external_tokens=hit_tokens
@@ -513,6 +525,7 @@ def test_eager_duplicate_store_skipped() -> None:
         pooling_params=None,
         mm_features=None,
         block_hasher=req._block_hasher,
+        cache_partition_id=OFFLOAD_TEST_CACHE_PARTITION_ID,
     )
     kv_blocks2 = _alloc_and_register(fix, req2, num_blocks)
     sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=0)
@@ -548,14 +561,14 @@ def test_lazy_duplicate_store_skipped() -> None:
 
     # Schedule + finish → hashed blocks in free queue
     gpu_blocks = _allocate_gpu_blocks(gpu_pool, req, num_blocks, group_id=0)
-    gpu_pool.free_blocks(gpu_blocks)
+    gpu_pool.free_blocks(gpu_blocks, req.cache_partition_id)
 
     # Flush old blocks to LRU head, then trigger lazy offload.
     fillers = _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=5)
     meta1 = sched.build_connector_meta(make_scheduler_output({}))
     assert meta1.store_event >= 0
     simulate_store_completion(sched, meta1.store_event)
-    gpu_pool.free_blocks(fillers)
+    gpu_pool.free_blocks(fillers, KV_CACHE_INTERNAL_PARTITION_ID)
     cpu_free_after_first = get_cpu_free_blocks(sched)
 
     # Allocate blocks with the same hashes and free them again.
@@ -567,14 +580,15 @@ def test_lazy_duplicate_store_skipped() -> None:
         pooling_params=None,
         mm_features=None,
         block_hasher=req._block_hasher,
+        cache_partition_id=OFFLOAD_TEST_CACHE_PARTITION_ID,
     )
     gpu_blocks2 = _allocate_gpu_blocks(gpu_pool, req2, num_blocks, group_id=0)
-    gpu_pool.free_blocks(gpu_blocks2)
+    gpu_pool.free_blocks(gpu_blocks2, req2.cache_partition_id)
 
     # Flush again so the hashed blocks are at LRU head for the scanner.
     fillers2 = _flush_old_blocks_to_lru_head(gpu_pool, num_filler_blocks=5)
     meta2 = sched.build_connector_meta(make_scheduler_output({}))
-    gpu_pool.free_blocks(fillers2)
+    gpu_pool.free_blocks(fillers2, KV_CACHE_INTERNAL_PARTITION_ID)
 
     # Either no store event, or zero new CPU blocks (already cached).
     if meta2.store_event >= 0:
@@ -716,10 +730,10 @@ def test_touched_blocks_survive_eviction() -> None:
         bhash_with_group = make_block_hash_with_group_id(bhash, 0)
         cached_blk = cpu_pool.cached_block_hash_to_block.get_one_block(bhash_with_group)
         assert cached_blk is not None
-        cpu_pool.touch([cached_blk])
+        cpu_pool.touch([cached_blk], req_a.cache_partition_id)
         # Undo touch to return ref_cnt to 0
         # (so it's a free candidate but at MRU position)
-        cpu_pool.free_blocks([cached_blk])
+        cpu_pool.free_blocks([cached_blk], req_a.cache_partition_id)
 
     # Now store 2 more blocks; req_b (LRU front) should be evicted, not req_a
     req_c = make_request(num_blocks=2)
@@ -777,11 +791,14 @@ def test_preemption_no_cpu_block_leak() -> None:
         pooling_params=None,
         mm_features=None,
         block_hasher=req._block_hasher,
+        cache_partition_id=OFFLOAD_TEST_CACHE_PARTITION_ID,
     )
     hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
     assert hit_tokens > 0
 
-    gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(num_blocks)
+    gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(
+        num_blocks, req2.cache_partition_id
+    )
     kv_blocks2 = KVCacheBlocks(blocks=(gpu_blocks2,))
     sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
 
@@ -872,11 +889,14 @@ def test_inflight_finish_deferred_cleanup() -> None:
         pooling_params=None,
         mm_features=None,
         block_hasher=req._block_hasher,
+        cache_partition_id=OFFLOAD_TEST_CACHE_PARTITION_ID,
     )
     hit_tokens, _ = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
     assert hit_tokens > 0
 
-    gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(num_blocks)
+    gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(
+        num_blocks, req2.cache_partition_id
+    )
     kv_blocks2 = KVCacheBlocks(blocks=(gpu_blocks2,))
     sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
 
@@ -954,6 +974,7 @@ def test_multi_group_null_blocks_skipped() -> None:
         pooling_params=None,
         mm_features=None,
         block_hasher=req._block_hasher,
+        cache_partition_id=OFFLOAD_TEST_CACHE_PARTITION_ID,
     )
     hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
     # Only 1 block was stored (the real one)
@@ -961,7 +982,7 @@ def test_multi_group_null_blocks_skipped() -> None:
     assert is_async is True
 
     # Allocate new GPU blocks for the load
-    gpu_blocks2 = gpu_pool.get_new_blocks(1)
+    gpu_blocks2 = gpu_pool.get_new_blocks(1, req2.cache_partition_id)
     kv_blocks2 = KVCacheBlocks(blocks=([gpu_blocks2[0], null_block],))
     sched.update_state_after_alloc(req2, kv_blocks2, num_external_tokens=hit_tokens)
 
@@ -1079,6 +1100,7 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
         pooling_params=None,
         mm_features=None,
         block_hasher=req._block_hasher,
+        cache_partition_id=OFFLOAD_TEST_CACHE_PARTITION_ID,
     )
 
     # GPU prefix cache hits the first 2 blocks.
@@ -1108,7 +1130,9 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
     # comp: GPU prefix cache hit — blocks with hashes
     gpu_comp = _allocate_gpu_blocks(gpu_pool, req2, 2, group_id=0)
     # ext_comp + new: freshly allocated, no hashes
-    gpu_ext_and_new = gpu_pool.get_new_blocks(num_ext_blocks + num_new_blocks)
+    gpu_ext_and_new = gpu_pool.get_new_blocks(
+        num_ext_blocks + num_new_blocks, req2.cache_partition_id
+    )
     all_gpu_blocks = gpu_comp + gpu_ext_and_new
     kv_blocks2 = KVCacheBlocks(blocks=(all_gpu_blocks,))
 

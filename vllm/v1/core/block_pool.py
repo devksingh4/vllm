@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+from vllm import envs
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -17,9 +19,13 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
+    CostAwareFreeKVCacheBlockQueue,
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    S3FIFOFreeBlockQueue,
+    SIEVEFreeBlockQueue,
+    TinyLFUFreeBlockQueue,
     generate_block_hash_extra_keys,
     get_block_hash,
     make_block_hash_with_group_id,
@@ -152,19 +158,86 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        partition_ref_caps: dict[str, int] | None = None,
+        partition_eviction_cost: dict[str, float] | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        self._partition_ref_caps = (
+            dict(partition_ref_caps) if partition_ref_caps is not None else None
+        )
+        self._partition_eviction_cost = (
+            dict(partition_eviction_cost)
+            if partition_eviction_cost is not None
+            else None
+        )
+        self._kv_logical_time = 0
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        gpu_policy = (envs.VLLM_KV_OFFLOAD_POLICY or "").lower()
+        use_cost_queue = (
+            self._partition_eviction_cost is not None
+            and gpu_policy not in ("s3fifo", "sieve", "tinylfu")
+        )
+        if use_cost_queue:
+            cost_map = self._partition_eviction_cost
+
+            def _cost_for_partition(pid: str) -> float:
+                c = cost_map.get(pid, 1.0)
+                return float(c) if c > 0 else 1.0
+
+            self.free_block_queue = CostAwareFreeKVCacheBlockQueue(
+                self.blocks,
+                cost_for_partition=_cost_for_partition,
+                logical_now_fn=lambda: self._kv_logical_time,
+            )
+            gpu_policy = "lru+cost_aware"
+        elif gpu_policy == "s3fifo":
+            if self._partition_eviction_cost is not None:
+                logger.warning(
+                    "partition_eviction_cost is ignored when GPU eviction policy "
+                    "is s3fifo (VLLM_KV_OFFLOAD_POLICY)."
+                )
+            self.free_block_queue: (
+                FreeKVCacheBlockQueue
+                | S3FIFOFreeBlockQueue
+                | SIEVEFreeBlockQueue
+                | TinyLFUFreeBlockQueue
+            ) = S3FIFOFreeBlockQueue(self.blocks)
+        elif gpu_policy == "sieve":
+            if self._partition_eviction_cost is not None:
+                logger.warning(
+                    "partition_eviction_cost is ignored when GPU eviction policy "
+                    "is sieve (VLLM_KV_OFFLOAD_POLICY)."
+                )
+            self.free_block_queue = SIEVEFreeBlockQueue(self.blocks)
+        elif gpu_policy == "tinylfu":
+            if self._partition_eviction_cost is not None:
+                logger.warning(
+                    "partition_eviction_cost is ignored when GPU eviction policy "
+                    "is tinylfu (VLLM_KV_OFFLOAD_POLICY)."
+                )
+            self.free_block_queue = TinyLFUFreeBlockQueue(self.blocks)
+        else:
+            gpu_policy = "lru"
+            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        logger.info("GPU KV cache eviction policy: %s", gpu_policy)
+        self._gpu_policy_name = gpu_policy
+
+        # Block-level counters for the chosen GPU eviction policy:
+        #   _policy_hit_blocks   — blocks reclaimed from the free queue via
+        #                          touch() before the policy could evict them
+        #   _policy_evict_blocks — blocks the policy chose to evict that were
+        #                          still in the prefix cache (hash-having)
+        # Hit rate = hits / (hits + evicts) is the apples-to-apples cross-policy
+        # measurement: it counts only block-level decisions the policy actually
+        # made, not preemption-inflated token re-queries.
+        self._policy_hit_blocks: int = 0
+        self._policy_evict_blocks: int = 0
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -179,6 +252,70 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        # Per-block ref attribution for partition metrics (ref_cnt contributions).
+        self._block_partition_refs: dict[int, dict[str, int]] = {}
+        self._partition_block_ref_totals: defaultdict[str, int] = defaultdict(int)
+
+    def get_partition_block_ref_totals(self) -> dict[str, int]:
+        """Snapshot of ref_cnt contributions attributed to each cache partition."""
+        return dict(self._partition_block_ref_totals)
+
+    def get_eviction_policy_stats(self) -> dict[str, int | str]:
+        """Cumulative block-level hit/evict counters for the GPU eviction policy."""
+        return {
+            "name": self._gpu_policy_name,
+            "hits": self._policy_hit_blocks,
+            "evicts": self._policy_evict_blocks,
+        }
+
+    def set_partition_ref_caps(self, caps: dict[str, int] | None) -> None:
+        """Dynamic two-level budgets: max ref-count contributions per partition.
+
+        Used by higher-level controllers to reapportion capacity without
+        restarting the engine. ``None`` disables caps.
+        """
+        self._partition_ref_caps = dict(caps) if caps is not None else None
+
+    def _note_block_partition_activity(
+        self, block: KVCacheBlock, cache_partition_id: str
+    ) -> None:
+        if block.is_null:
+            return
+        self._kv_logical_time += 1
+        block.kv_access_seq = self._kv_logical_time
+        block.kv_eviction_tag = cache_partition_id
+
+    def _partition_note_ref(
+        self, block: KVCacheBlock, cache_partition_id: str, delta: int
+    ) -> None:
+        if block.is_null:
+            return
+        bid = block.block_id
+        if delta == 1:
+            per_block = self._block_partition_refs.setdefault(bid, {})
+            per_block[cache_partition_id] = per_block.get(cache_partition_id, 0) + 1
+            self._partition_block_ref_totals[cache_partition_id] += 1
+        elif delta == -1:
+            # Tests (and some edge paths) may free blocks that were never
+            # allocated through this pool with partition tracking; skip metrics
+            # adjustment when there is no matching recorded ref.
+            per_block = self._block_partition_refs.get(bid)
+            if per_block is None:
+                return
+            prev = per_block.get(cache_partition_id, 0)
+            if prev <= 0:
+                return
+            per_block[cache_partition_id] = prev - 1
+            self._partition_block_ref_totals[cache_partition_id] -= 1
+            if per_block[cache_partition_id] == 0:
+                del per_block[cache_partition_id]
+            if not per_block:
+                del self._block_partition_refs[bid]
+            if self._partition_block_ref_totals[cache_partition_id] == 0:
+                del self._partition_block_ref_totals[cache_partition_id]
+        else:
+            raise ValueError(f"delta must be ±1, got {delta}")
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -306,18 +443,22 @@ class BlockPool:
                     parent_block_hash=parent_block_hash,
                     token_ids=request.all_token_ids[start_token_idx:end_token_idx],
                     block_size=block_size,
-                    lora_id=request.lora_request.adapter_id
-                    if request.lora_request
-                    else None,
+                    lora_id=(
+                        request.lora_request.adapter_id
+                        if request.lora_request
+                        else None
+                    ),
                     medium=MEDIUM_GPU,
-                    lora_name=request.lora_request.name
-                    if request.lora_request
-                    else None,
+                    lora_name=(
+                        request.lora_request.name if request.lora_request else None
+                    ),
                     extra_keys=extra_keys_list if extra_keys_list else None,
                 )
             )
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(
+        self, num_blocks: int, cache_partition_id: str
+    ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
@@ -331,6 +472,17 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
+        if self._partition_ref_caps is not None:
+            cap = self._partition_ref_caps.get(cache_partition_id)
+            if cap is not None:
+                cur = self._partition_block_ref_totals.get(cache_partition_id, 0)
+                if cur + num_blocks > cap:
+                    raise ValueError(
+                        "cache_partition_id "
+                        f"{cache_partition_id!r} would exceed ref cap "
+                        f"({cur} + {num_blocks} > {cap}); two-level quota policy"
+                    )
+
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
@@ -339,12 +491,16 @@ class BlockPool:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                self._partition_note_ref(block, cache_partition_id, 1)
+                self._note_block_partition_activity(block, cache_partition_id)
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                self._partition_note_ref(block, cache_partition_id, 1)
+                self._note_block_partition_activity(block, cache_partition_id)
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
@@ -374,6 +530,9 @@ class BlockPool:
             # eviction is not needed
             return False
 
+        # Block was actually cached and is now being evicted by the policy.
+        self._policy_evict_blocks += 1
+
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -389,38 +548,53 @@ class BlockPool:
             )
         return True
 
-    def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+    def touch(self, blocks: Sequence[KVCacheBlock], cache_partition_id: str) -> None:
         """Touch a block increases its reference count by 1, and may remove
         the block from the free queue. This is used when a block is hit by
         another request with the same prefix.
 
         Args:
             blocks: A list of blocks to touch.
+            cache_partition_id: Logical partition owning this ref increment
+                (for metrics only).
         """
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                self._policy_hit_blocks += 1
             block.ref_cnt += 1
+            self._partition_note_ref(block, cache_partition_id, 1)
+            self._note_block_partition_activity(block, cache_partition_id)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+    def free_blocks(
+        self,
+        ordered_blocks: Iterable[KVCacheBlock],
+        cache_partition_id: str,
+    ) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
+            cache_partition_id: Logical partition releasing one ref per block
+                (for metrics only).
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
+        to_append: list[KVCacheBlock] = []
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+            if not block.is_null:
+                self._partition_note_ref(block, cache_partition_id, -1)
+            if block.ref_cnt == 0 and not block.is_null:
+                self._note_block_partition_activity(block, cache_partition_id)
+                to_append.append(block)
+        self.free_block_queue.append_n(to_append)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -468,6 +642,9 @@ class BlockPool:
 
         if self.metrics_collector:
             self.metrics_collector.reset()
+
+        self._block_partition_refs.clear()
+        self._partition_block_ref_totals.clear()
 
         logger.info("Successfully reset prefix cache")
 
