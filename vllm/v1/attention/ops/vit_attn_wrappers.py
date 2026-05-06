@@ -12,12 +12,20 @@ latencies by ~7% (see qwen2_5_vl for example usage)
 To use these ops, you must have a recent version of PyTorch installed (>= 2.4.0)
 """
 
-import einops
+from functools import cache
+
 import torch
 import torch.nn.functional as F
 
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+@cache
+def _einops():
+    import einops
+
+    return einops
 
 
 def flash_attn_maxseqlen_wrapper(
@@ -47,7 +55,8 @@ def flash_attn_maxseqlen_wrapper(
         )
     max_seqlen = q_len if max_seqlen is None else max_seqlen.item()
 
-    q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+    eo = _einops()
+    q, k, v = (eo.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
     output = flash_attn_varlen_func(
         q,
         k,
@@ -61,7 +70,7 @@ def flash_attn_maxseqlen_wrapper(
         softmax_scale=scale,
         **kwargs,
     )
-    context_layer = einops.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
+    context_layer = eo.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
     return context_layer
 
 
@@ -128,7 +137,8 @@ def triton_attn_wrapper(
         )
     max_seqlen = q_len if max_seqlen is None else max_seqlen.item()
 
-    q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+    eo = _einops()
+    q, k, v = (eo.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
     output = torch.empty_like(q)
     context_attention_fwd(
         q,
@@ -144,7 +154,7 @@ def triton_attn_wrapper(
         softmax_scale=scale,
     )
 
-    context_layer = einops.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
+    context_layer = eo.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
     return context_layer
 
 
@@ -198,11 +208,12 @@ def apply_sdpa(
     Input shape:
     (batch_size x seq_len x num_heads x head_size)
     """
-    q, k, v = (einops.rearrange(x, "b s h d -> b h s d") for x in [q, k, v])
+    eo = _einops()
+    q, k, v = (eo.rearrange(x, "b s h d -> b h s d") for x in [q, k, v])
     output = F.scaled_dot_product_attention(
         q, k, v, dropout_p=0.0, scale=scale, enable_gqa=enable_gqa
     )
-    output = einops.rearrange(output, "b h s d -> b s h d ")
+    output = eo.rearrange(output, "b h s d -> b s h d ")
     return output
 
 
@@ -286,7 +297,8 @@ def flashinfer_wrapper(
 
     if is_reshaped:
         reshape_batch_size = q.shape[0]
-        q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+        eo = _einops()
+        q, k, v = (eo.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
     # cuDNN <= 9.10.2.21 requires q, k to be contiguous
     # this comes with no cost for ViTs with RoPE because
     # RoPE has already made q and k contiguous.
@@ -318,7 +330,7 @@ def flashinfer_wrapper(
     )
 
     if is_reshaped:
-        output = einops.rearrange(output, "(b s) h d -> b s h d", b=reshape_batch_size)
+        output = eo.rearrange(output, "(b s) h d -> b s h d", b=reshape_batch_size)
 
     return output
 

@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
 from collections.abc import Iterable
-from typing import Literal
 
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
     LoadStoreSpec,
@@ -12,13 +14,86 @@ from vllm.v1.kv_offload.abstract import (
 )
 from vllm.v1.kv_offload.cpu.policies.abstract import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+from vllm.v1.kv_offload.cpu.policies.lora_aware import (
+    LoRAAdaptiveBudgetPolicy,
+    LoRABudgetPolicy,
+    LoRACorrelatedTouchPolicy,
+    LoRACostAwarePolicy,
+    LoRAFrequencyWeightedPolicy,
+    LoRAGhostListPolicy,
+    LoRAHysteresisCouplingPolicy,
+    LoRALooseCouplingPolicy,
+    LoRALooseFrequencyPolicy,
+    LoRALooseGhostPolicy,
+    LoRALooseHysteresisPolicy,
+    LoRAPositionAwarePolicy,
+    LoRAPrefixTreePolicy,
+    LoRASoftBoostCouplingPolicy,
+    LoRATightCouplingPolicy,
+    LoRATwoLevelLRUPolicy,
+)
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+from vllm.v1.kv_offload.cpu.policies.lru_k import LRUKCachePolicy
+from vllm.v1.kv_offload.cpu.policies.s3fifo import S3FIFOCachePolicy
+from vllm.v1.kv_offload.cpu.policies.sieve import SIEVECachePolicy
+from vllm.v1.kv_offload.cpu.policies.tinylfu import TinyLFUCachePolicy
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 
-_CACHE_POLICIES: dict[str, type[CachePolicy]] = {
+logger = init_logger(__name__)
+
+_BASE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
+    "sieve": SIEVECachePolicy,
+    "s3fifo": S3FIFOCachePolicy,
+    "tinylfu": TinyLFUCachePolicy,
+    "lru_k": LRUKCachePolicy,
+    "lora_twolevel": LoRATwoLevelLRUPolicy,
 }
+
+_LORA_COUPLING_MODES: dict[str, type] = {
+    "lora_tight": LoRATightCouplingPolicy,
+    "lora_loose": LoRALooseCouplingPolicy,
+    "lora_hysteresis": LoRAHysteresisCouplingPolicy,
+    "lora_soft": LoRASoftBoostCouplingPolicy,
+    "lora_freqweighted": LoRAFrequencyWeightedPolicy,
+    "lora_correlated": LoRACorrelatedTouchPolicy,
+    "lora_budget": LoRABudgetPolicy,
+    "lora_adabudget": LoRAAdaptiveBudgetPolicy,
+    "lora_costaware": LoRACostAwarePolicy,
+    "lora_ghost": LoRAGhostListPolicy,
+    "lora_position": LoRAPositionAwarePolicy,
+    "lora_prefixtree": LoRAPrefixTreePolicy,
+    "lora_loose_hysteresis": LoRALooseHysteresisPolicy,
+    "lora_loose_freq": LoRALooseFrequencyPolicy,
+    "lora_loose_ghost": LoRALooseGhostPolicy,
+}
+
+def _build_policy(name: str, capacity: int) -> tuple[CachePolicy, str]:
+    """Build a CachePolicy from a policy name. Names may be plain (``"lru"``)
+    or coupled (``"lora_tight:sieve"``)."""
+    if ":" in name:
+        coupling_name, base_name = name.split(":", 1)
+        coupling_cls = _LORA_COUPLING_MODES.get(coupling_name)
+        base_cls = _BASE_POLICIES.get(base_name)
+        if coupling_cls is None:
+            raise ValueError(
+                f"Unknown LoRA coupling mode: {coupling_name!r}. "
+                f"Supported: {list(_LORA_COUPLING_MODES)}"
+            )
+        if base_cls is None:
+            raise ValueError(
+                f"Unknown base cache policy: {base_name!r}. "
+                f"Supported: {list(_BASE_POLICIES)}"
+            )
+        return coupling_cls(cache_capacity=capacity, inner_cls=base_cls), name
+
+    policy_cls = _BASE_POLICIES.get(name)
+    if policy_cls is None:
+        raise ValueError(
+            f"Unknown cache policy: {name!r}. Supported: {list(_BASE_POLICIES)}"
+        )
+    return policy_cls(cache_capacity=capacity), name
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -35,7 +110,7 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         block_size: int,
         num_blocks: int,
-        cache_policy: Literal["lru", "arc"] = "lru",
+        cache_policy: str | None = None,
         enable_events: bool = False,
     ):
         self.block_size: int = block_size
@@ -44,13 +119,68 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_allocated_blocks: int = 0
         self._free_list: list[int] = []
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
-        policy_cls = _CACHE_POLICIES.get(cache_policy)
-        if policy_cls is None:
-            raise ValueError(
-                f"Unknown cache policy: {cache_policy!r}. "
-                f"Supported: {list(_CACHE_POLICIES)}"
-            )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
+        if raw_val := envs.VLLM_KV_OFFLOAD_POLICY:
+            cache_policy = raw_val.lower()
+        self._policy, self._policy_name = _build_policy(
+            cache_policy or "", num_blocks
+        )
+        atexit.register(self._log_policy_stats)
+
+    def _log_policy_stats(self) -> None:
+        s = self._policy.stats
+        touch_evict_ratio = (
+            f"{s.touch_blocks / s.evict_blocks:.1f}"
+            if s.evict_blocks > 0
+            else "inf"
+        )
+        avg_scan = (
+            f"{s.evict_scan_steps / s.evict_calls:.1f}"
+            if s.evict_calls > 0
+            else "n/a"
+        )
+        hit_rate = (
+            f"{s.lookup_hit_blocks / s.lookup_total_blocks:.2%}"
+            if s.lookup_total_blocks > 0
+            else "n/a"
+        )
+        logger.info(
+            "Policy stats [%s]: "
+            "touch=%d calls (%d blocks) | "
+            "evict=%d calls (%d blocks, %d failed) | "
+            "avg_scan_steps=%s | "
+            "touch:evict block ratio=%s | "
+            "inserts=%d removes=%d gets=%d | "
+            "cache_size_at_last_evict=%d | "
+            "cpu_offload_hit_rate=%s (%d/%d blocks)",
+            self._policy_name,
+            s.touch_calls,
+            s.touch_blocks,
+            s.evict_calls,
+            s.evict_blocks,
+            s.evict_failed,
+            avg_scan,
+            touch_evict_ratio,
+            s.insert_calls,
+            s.remove_calls,
+            s.get_calls,
+            s.cache_size_at_last_evict,
+            hit_rate,
+            s.lookup_hit_blocks,
+            s.lookup_total_blocks,
+        )
+
+    def register_block_adapters(
+        self, mapping: dict[BlockHash, str | None]
+    ) -> None:
+        """No-op unless the active policy is LoRA-aware."""
+        if hasattr(self._policy, "register_block_adapter"):
+            for block_hash, adapter_id in mapping.items():
+                self._policy.register_block_adapter(block_hash, adapter_id)
+
+    def update_live_adapters(self, adapters: set[str]) -> None:
+        """No-op unless the active policy is LoRA-aware."""
+        if hasattr(self._policy, "update_live_adapters"):
+            self._policy.update_live_adapters(adapters)
 
     # --- block pool ---
 
@@ -88,12 +218,15 @@ class CPUOffloadingManager(OffloadingManager):
     # --- OffloadingManager interface ---
 
     def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
+        block_hashes_list = list(block_hashes)
         hit_count = 0
-        for block_hash in block_hashes:
+        for block_hash in block_hashes_list:
             block = self._policy.get(block_hash)
             if block is None or not block.is_ready:
                 break
             hit_count += 1
+        self._policy.stats.lookup_hit_blocks += hit_count
+        self._policy.stats.lookup_total_blocks += len(block_hashes_list)
         return hit_count
 
     def prepare_load(self, block_hashes: Iterable[BlockHash]) -> LoadStoreSpec:
@@ -158,9 +291,9 @@ class CPUOffloadingManager(OffloadingManager):
             )
 
         blocks = self._allocate_blocks(block_hashes_to_store)
-        assert len(blocks) == len(block_hashes_to_store), (
-            "Block pool did not allocate the expected number of blocks"
-        )
+        assert len(blocks) == len(
+            block_hashes_to_store
+        ), "Block pool did not allocate the expected number of blocks"
 
         for block_hash, block in zip(block_hashes_to_store, blocks):
             self._policy.insert(block_hash, block)
@@ -206,3 +339,6 @@ class CPUOffloadingManager(OffloadingManager):
         if self.events is not None:
             yield from self.events
             self.events.clear()
+
+    def get_policy_stats(self):
+        return self._policy.stats

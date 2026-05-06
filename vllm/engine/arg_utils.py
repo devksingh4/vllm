@@ -632,6 +632,12 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+    kv_cache_partition_ref_caps: dict[str, int] | None = (
+        CacheConfig.kv_cache_partition_ref_caps
+    )
+    kv_cache_partition_eviction_cost: dict[str, float] | None = (
+        CacheConfig.kv_cache_partition_eviction_cost
+    )
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1052,6 +1058,14 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--kv-cache-partition-ref-caps",
+            **cache_kwargs["kv_cache_partition_ref_caps"],
+        )
+        cache_group.add_argument(
+            "--kv-cache-partition-eviction-cost",
+            **cache_kwargs["kv_cache_partition_eviction_cost"],
         )
 
         # Model weight offload related configs
@@ -1619,6 +1633,8 @@ class EngineArgs:
             mamba_cache_philox_rounds=self.mamba_cache_philox_rounds,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            kv_cache_partition_ref_caps=self.kv_cache_partition_ref_caps,
+            kv_cache_partition_eviction_cost=self.kv_cache_partition_eviction_cost,
         )
 
         ray_runtime_env = None

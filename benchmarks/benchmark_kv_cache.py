@@ -1,0 +1,644 @@
+"""Benchmark KV cache eviction policies. Workloads: uniform, zipfian,
+temporal, scan-resistant, helm, multi-partition."""
+
+import json
+import os
+import random
+import time
+from collections import defaultdict
+from typing import List
+
+import numpy as np
+import torch
+
+from vllm import LLM, SamplingParams
+from vllm.engine.arg_utils import EngineArgs
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+IS_CPU = not torch.cuda.is_available()
+
+
+def _setup_cpu_env(cpu_kv_cache_gib: int = 4) -> None:
+    if IS_CPU:
+        os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", str(cpu_kv_cache_gib))
+
+
+_PREFIX_WORDS = [
+    "algorithm", "optimization", "throughput", "latency", "bandwidth",
+    "pipeline", "scheduler", "prefetch", "eviction", "allocation",
+    "partition", "replication", "consistency", "transaction", "isolation",
+    "concurrency", "parallelism", "synchronization", "deadlock", "mutex",
+    "processor", "register", "instruction", "operand", "accumulator",
+    "interrupt", "exception", "privilege", "virtual", "physical",
+]
+
+_QUESTIONS = [
+    "Summarize the key themes in one sentence.",
+    "What optimization technique appears most often?",
+    "List three concepts related to concurrency.",
+    "Identify a potential trade-off mentioned in the text.",
+    "Which scheduling concept is most relevant to latency?",
+    "What is the relationship between throughput and bandwidth?",
+    "Name a synchronization primitive from the passage.",
+    "How does the pipeline concept relate to parallelism here?",
+    "What memory-management concepts are discussed?",
+    "Describe the main topic in exactly two words.",
+]
+
+
+def generate_shared_prefix(num_words: int, seed: int = 42) -> str:
+    return " ".join(random.Random(seed).choices(_PREFIX_WORDS, k=num_words))
+
+
+def _unique_padding(rng: random.Random, num_words: int) -> str:
+    return " ".join(rng.choices(_PREFIX_WORDS, k=num_words))
+
+def _make_prompt(prefix: str, padding: str, question: str) -> str:
+    return f"{prefix}\n\n{padding}\n\nQuestion: {question}\nAnswer:"
+
+
+def workload_uniform(
+    num_batches: int, batch_size: int, prefix_words: int, suffix_words: int,
+) -> list[list[str]]:
+    prefix = generate_shared_prefix(prefix_words)
+    rng = random.Random(123)
+    batches = []
+    for b in range(num_batches):
+        batch = []
+        for i in range(batch_size):
+            q = _QUESTIONS[(b * batch_size + i) % len(_QUESTIONS)]
+            batch.append(_make_prompt(prefix, _unique_padding(rng, suffix_words), q))
+        batches.append(batch)
+    return batches
+
+
+def _zipfian_indices(
+    num_prefixes: int, num_requests: int, alpha: float = 1.2, seed: int = 42,
+) -> list[int]:
+    np.random.seed(seed)
+    ranks = np.arange(1, num_prefixes + 1)
+    probs = 1.0 / (ranks ** alpha)
+    probs /= probs.sum()
+    return np.random.choice(num_prefixes, size=num_requests, p=probs).tolist()
+
+
+def _temporal_indices(
+    num_prefixes: int, num_requests: int,
+    working_set_size: int = 10, phase_length: int = 100, seed: int = 42,
+) -> list[int]:
+    np.random.seed(seed)
+    indices: list[int] = []
+    num_phases = (num_requests + phase_length - 1) // phase_length
+    for phase in range(num_phases):
+        start = (phase * working_set_size // 2) % max(
+            1, num_prefixes - working_set_size
+        )
+        hot = list(range(start, min(start + working_set_size, num_prefixes)))
+        cold = [i for i in range(num_prefixes) if i not in hot]
+        phase_reqs = min(phase_length, num_requests - len(indices))
+        for _ in range(phase_reqs):
+            if np.random.random() < 0.8 and hot:
+                indices.append(np.random.choice(hot))
+            elif cold:
+                indices.append(np.random.choice(cold))
+            elif hot:
+                indices.append(np.random.choice(hot))
+    return indices[:num_requests]
+
+
+def _scan_resistant_indices(
+    num_prefixes: int, num_requests: int,
+    working_set_size: int = 5, scan_size: int = 50, seed: int = 42,
+) -> list[int]:
+    np.random.seed(seed)
+    hot = list(range(working_set_size))
+    scan = list(range(working_set_size, min(working_set_size + scan_size, num_prefixes)))
+    pos = 0
+    indices: list[int] = []
+    for i in range(num_requests):
+        if i % 10 < 7:
+            indices.append(np.random.choice(hot))
+        else:
+            indices.append(scan[pos % len(scan)])
+            pos += 1
+    return indices
+
+
+def _batches_from_indices(
+    prefixes: list[str], indices: list[int],
+    num_batches: int, batch_size: int, suffix_words: int,
+) -> list[list[str]]:
+    rng = random.Random(123)
+    batches: list[list[str]] = []
+    idx = 0
+    for b in range(num_batches):
+        batch: list[str] = []
+        for i in range(batch_size):
+            if idx >= len(indices):
+                break
+            q = _QUESTIONS[(b * batch_size + i) % len(_QUESTIONS)]
+            batch.append(_make_prompt(
+                prefixes[indices[idx]], _unique_padding(rng, suffix_words), q,
+            ))
+            idx += 1
+        if batch:
+            batches.append(batch)
+    return batches
+
+
+def workload_patterned(
+    pattern: str, num_batches: int, batch_size: int,
+    prefix_words: int, suffix_words: int, num_prefixes: int,
+    zipfian_alpha: float = 1.5, working_set_size: int = 15,
+) -> list[list[str]]:
+    prefixes = [
+        generate_shared_prefix(prefix_words + i * 10, seed=42 + i)
+        for i in range(num_prefixes)
+    ]
+    n = num_batches * batch_size
+
+    if pattern == "zipfian":
+        indices = _zipfian_indices(num_prefixes, n, zipfian_alpha)
+    elif pattern == "temporal":
+        indices = _temporal_indices(num_prefixes, n, working_set_size)
+    elif pattern == "scan-resistant":
+        indices = _scan_resistant_indices(num_prefixes, n, working_set_size)
+    else:
+        raise ValueError(f"Unknown pattern: {pattern}")
+
+    counts = defaultdict(int)
+    for i in indices:
+        counts[i] += 1
+    print(f"Prefix access distribution (top 5): "
+          f"{dict(sorted(counts.items(), key=lambda x: -x[1])[:5])}")
+
+    return _batches_from_indices(
+        prefixes, indices, num_batches, batch_size, suffix_words,
+    )
+
+
+def workload_helm(
+    task: str, num_examples: int, num_test: int, batch_size: int,
+) -> list[list[str]]:
+    from datasets import load_dataset
+
+    task_datasets = {
+        "copa": ("super_glue", "copa"),
+        "piqa": ("piqa", None),
+        "winogrande": ("winogrande", "winogrande_xl"),
+    }
+    if task not in task_datasets:
+        raise ValueError(f"Unknown HELM task: {task}. Choose from {list(task_datasets)}")
+
+    ds_name, config = task_datasets[task]
+    load_kw = dict(name=config) if config else {}
+    train = load_dataset(ds_name, split="train", **load_kw)
+    test = load_dataset(ds_name, split="validation", **load_kw)
+
+    prefix = "Answer the following questions.\n\n"
+    for i, ex in enumerate(train):
+        if i >= num_examples:
+            break
+        if task == "copa":
+            ans = ex["choice1"] if ex["label"] == 0 else ex["choice2"]
+            prefix += (f"Premise: {ex['premise']}\n"
+                       f"Question: What is the {ex['question']}?\n"
+                       f"Choice 1: {ex['choice1']}\nChoice 2: {ex['choice2']}\n"
+                       f"Answer: {ans}\n\n")
+        elif task == "piqa":
+            ans = ex["sol1"] if ex["label"] == 0 else ex["sol2"]
+            prefix += f"Goal: {ex['goal']}\nSolution: {ans}\n\n"
+        elif task == "winogrande":
+            correct = ex["option1"] if ex["answer"] == "1" else ex["option2"]
+            prefix += f"Sentence: {ex['sentence']}\nAnswer: {correct}\n\n"
+
+    prompts: List[str] = []
+    for i, ex in enumerate(test):
+        if i >= num_test:
+            break
+        if task == "copa":
+            prompts.append(
+                prefix + f"Premise: {ex['premise']}\n"
+                f"Question: What is the {ex['question']}?\n"
+                f"Choice 1: {ex['choice1']}\nChoice 2: {ex['choice2']}\n"
+                f"Answer:")
+        elif task == "piqa":
+            prompts.append(prefix + f"Goal: {ex['goal']}\nSolution:")
+        elif task == "winogrande":
+            prompts.append(prefix + f"Sentence: {ex['sentence']}\nAnswer:")
+
+    return [prompts[i:i + batch_size] for i in range(0, len(prompts), batch_size)]
+
+
+def workload_multi_turn(
+    num_batches: int,
+    batch_size: int,
+    num_sessions: int,
+    turns_per_session: int,
+    one_shot_fraction: float,
+    system_prompt_words: int,
+    user_msg_words: int,
+    assistant_resp_words: int,
+    one_shot_prefix_words: int,
+    zipfian_alpha: float,
+    seed: int = 42,
+) -> list[list[str]]:
+    rng = random.Random(seed)
+    np.random.seed(seed)
+
+    system_prompt = generate_shared_prefix(system_prompt_words, seed=1)
+
+    sessions: list[list[str]] = []
+    for sid in range(num_sessions):
+        s_rng = random.Random(seed + sid + 1)
+        history = ""
+        turn_prompts: list[str] = []
+        for _ in range(turns_per_session):
+            user_msg = " ".join(s_rng.choices(_PREFIX_WORDS, k=user_msg_words))
+            full_prompt = (
+                f"{system_prompt}\n{history}\nUser: {user_msg}\nAssistant:"
+            )
+            turn_prompts.append(full_prompt)
+            assistant_resp = " ".join(
+                s_rng.choices(_PREFIX_WORDS, k=assistant_resp_words)
+            )
+            history += f"\nUser: {user_msg}\nAssistant: {assistant_resp}\n"
+        sessions.append(turn_prompts)
+
+    n_total = num_batches * batch_size
+
+    session_probs = 1.0 / (np.arange(1, num_sessions + 1) ** zipfian_alpha)
+    session_probs /= session_probs.sum()
+    session_cursors = [0] * num_sessions  # next turn index per session
+
+    requests: list[str] = []
+    one_shot_count = 0
+    session_call_counts: dict[int, int] = defaultdict(int)
+    for i in range(n_total):
+        if rng.random() < one_shot_fraction:
+            unique = " ".join(rng.choices(_PREFIX_WORDS, k=one_shot_prefix_words))
+            q = _QUESTIONS[i % len(_QUESTIONS)]
+            requests.append(
+                f"{system_prompt}\n\n{unique}\n\nQuestion: {q}\nAnswer:"
+            )
+            one_shot_count += 1
+        else:
+            sid = int(np.random.choice(num_sessions, p=session_probs))
+            tid = session_cursors[sid] % turns_per_session
+            session_cursors[sid] += 1
+            session_call_counts[sid] += 1
+            requests.append(sessions[sid][tid])
+
+    avg_session_tokens = (
+        system_prompt_words
+        + turns_per_session * (user_msg_words + assistant_resp_words)
+    )
+    print(
+        f"Multi-turn workload: {num_sessions} sessions × {turns_per_session} turns "
+        f"({avg_session_tokens} words deep), "
+        f"{one_shot_count}/{n_total} one-shot ({one_shot_count/n_total:.0%}), "
+        f"system_prompt={system_prompt_words} words"
+    )
+    top_sessions = sorted(
+        session_call_counts.items(), key=lambda kv: -kv[1]
+    )[:5]
+    print(
+        f"Hottest 5 sessions (calls): "
+        f"{ {f's{sid}': c for sid, c in top_sessions} }"
+    )
+
+    return [requests[i:i + batch_size] for i in range(0, n_total, batch_size)]
+
+
+def workload_multi_partition(
+    partition_config: dict[str, dict],
+    batch_size: int,
+    suffix_words: int,
+) -> tuple[list[list[str]], list[list[str]]]:
+    all_prompts: list[tuple[str, str]] = []  # (prompt, partition_id)
+    for pid, cfg in partition_config.items():
+        n_req = cfg.get("num_requests", 16)
+        pw = cfg.get("prefix_words", 200)
+        sw = cfg.get("suffix_words", suffix_words)
+        n_pfx = cfg.get("num_prefixes", 10)
+
+        prefixes = [
+            generate_shared_prefix(pw + j * 10, seed=hash(pid) + j)
+            for j in range(n_pfx)
+        ]
+        rng = random.Random(hash(pid))
+        for i in range(n_req):
+            pfx = prefixes[i % n_pfx]
+            q = _QUESTIONS[i % len(_QUESTIONS)]
+            prompt = _make_prompt(pfx, _unique_padding(rng, sw), q)
+            all_prompts.append((prompt, pid))
+
+    rng_shuffle = random.Random(42)
+    rng_shuffle.shuffle(all_prompts)
+
+    batches: list[list[str]] = []
+    batch_pids: list[list[str]] = []
+    for i in range(0, len(all_prompts), batch_size):
+        chunk = all_prompts[i:i + batch_size]
+        batches.append([p for p, _ in chunk])
+        batch_pids.append([pid for _, pid in chunk])
+
+    counts: dict[str, int] = defaultdict(int)
+    for _, pid in all_prompts:
+        counts[pid] += 1
+    print(f"Multi-partition request distribution: "
+          f"{dict(sorted(counts.items(), key=lambda x: -x[1]))}")
+
+    return batches, batch_pids
+
+
+def _make_sp_for_partition(
+    base: SamplingParams, partition_id: str,
+) -> SamplingParams:
+    return SamplingParams(
+        temperature=base.temperature,
+        max_tokens=base.max_tokens,
+        ignore_eos=base.ignore_eos,
+        extra_args={"cache_partition_id": partition_id},
+    )
+
+
+def run_benchmark(
+    llm: LLM,
+    batches: list[list[str]],
+    sampling_params: SamplingParams,
+    batch_partition_ids: list[list[str]] | list[str] | None = None,
+) -> dict:
+    total_in = 0
+    total_out = 0
+    batch_times: list[float] = []
+    all_ttft: list[float] = []
+    partition_ttft: dict[str, list[float]] = defaultdict(list)
+
+    num_batches = len(batches)
+    print(f"\nRunning {num_batches} batches...")
+    overall_start = time.time()
+
+    for i, batch in enumerate(batches):
+        pids: list[str] | None = None
+        if batch_partition_ids is not None:
+            entry = batch_partition_ids[i]
+            if isinstance(entry, str):
+                pids = [entry] * len(batch)
+            else:
+                pids = list(entry)
+
+        if pids is not None:
+            unique_pids = set(pids)
+            if len(unique_pids) == 1:
+                sp: SamplingParams | list[SamplingParams] = _make_sp_for_partition(
+                    sampling_params, pids[0],
+                )
+            else:
+                sp = [_make_sp_for_partition(sampling_params, p) for p in pids]
+        else:
+            sp = sampling_params
+
+        t0 = time.time()
+        outputs = llm.generate(batch, sp)
+        elapsed = time.time() - t0
+        batch_times.append(elapsed)
+
+        b_in = sum(len(o.prompt_token_ids or []) for o in outputs)
+        b_out = sum(len(o.outputs[0].token_ids) for o in outputs)
+        total_in += b_in
+        total_out += b_out
+
+        for j, o in enumerate(outputs):
+            if o.metrics is not None and o.metrics.first_token_latency > 0:
+                ttft_val = o.metrics.first_token_latency
+                all_ttft.append(ttft_val)
+                if pids is not None:
+                    partition_ttft[pids[j]].append(ttft_val)
+
+        b_ttft = [
+            o.metrics.first_token_latency
+            for o in outputs
+            if o.metrics is not None and o.metrics.first_token_latency > 0
+        ]
+        ttft_str = ""
+        if b_ttft:
+            ttft_str = f"  ttft_mean={sum(b_ttft)/len(b_ttft)*1000:.0f}ms"
+
+        if pids is not None:
+            pid_counts = defaultdict(int)
+            for p in pids:
+                pid_counts[p] += 1
+            pid_str = "  [" + "+".join(
+                f"{k}:{v}" for k, v in sorted(pid_counts.items())
+            ) + "]"
+        else:
+            pid_str = ""
+
+        print(f"  Batch {i+1}/{num_batches}{pid_str}: {elapsed:.2f}s "
+              f"({b_in} in / {b_out} out){ttft_str}")
+
+    wall = time.time() - overall_start
+    return {
+        "wall_s": wall,
+        "total_in": total_in,
+        "total_out": total_out,
+        "batch_times": batch_times,
+        "all_ttft": all_ttft,
+        "partition_ttft": dict(partition_ttft),
+    }
+
+
+def print_results(metrics: dict, policy: str, workload: str) -> None:
+    wall = metrics["wall_s"]
+    total_in = metrics["total_in"]
+    total_out = metrics["total_out"]
+    total = total_in + total_out
+
+    print("\n--- Benchmark Results ---")
+    print(f"Policy:                 {policy}")
+    print(f"Workload:               {workload}")
+    print(f"Total Time:             {wall:.2f} seconds")
+    print(f"Total Input Tokens:     {total_in}")
+    print(f"Total Output Tokens:    {total_out}")
+    print(f"Total Token Throughput: {total / wall:.2f} tokens/s")
+    print(f"Output Only Throughput: {total_out / wall:.2f} tokens/s")
+
+    bt = sorted(metrics["batch_times"])
+    n = len(bt)
+    print("\nBatch Latency Percentiles:")
+    print(f"  P50 (median):         {bt[n // 2]:.2f}s")
+    print(f"  P95:                  {bt[int(n * 0.95)]:.2f}s")
+    print(f"  P99:                  {bt[min(int(n * 0.99), n - 1)]:.2f}s")
+
+    ttft = sorted(metrics["all_ttft"])
+    if ttft:
+        n = len(ttft)
+        print(f"\nTime-to-First-Token (TTFT) — {n} requests:")
+        print(f"  Min:                  {min(ttft) * 1000:.1f} ms")
+        print(f"  Mean:                 {sum(ttft) / n * 1000:.1f} ms")
+        print(f"  P50 (median):         {ttft[n // 2] * 1000:.1f} ms")
+        print(f"  P95:                  {ttft[int(n * 0.95)] * 1000:.1f} ms")
+        print(f"  P99:                  {ttft[min(int(n * 0.99), n - 1)] * 1000:.1f} ms")
+        print(f"  Max:                  {max(ttft) * 1000:.1f} ms")
+    else:
+        print("\nTTFT: not available (metrics not populated)")
+
+    part_ttft = metrics.get("partition_ttft", {})
+    if part_ttft:
+        print("\nPer-partition TTFT:")
+        for pid in sorted(part_ttft):
+            vals = sorted(part_ttft[pid])
+            pn = len(vals)
+            if pn == 0:
+                continue
+            print(f"  [{pid}] n={pn}  "
+                  f"mean={sum(vals)/pn*1000:.1f}ms  "
+                  f"p50={vals[pn//2]*1000:.1f}ms  "
+                  f"p99={vals[min(int(pn*0.99), pn-1)]*1000:.1f}ms")
+
+
+def create_parser() -> FlexibleArgumentParser:
+    p = FlexibleArgumentParser(
+        description="Benchmark KV cache eviction policies"
+    )
+
+    p.add_argument(
+        "--workload",
+        choices=["uniform", "zipfian", "temporal", "scan-resistant", "helm",
+                 "multi-partition", "multi-turn"],
+        default="zipfian",
+        help="Workload pattern (default: zipfian)",
+    )
+
+    p.add_argument("--num-batches", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--prefix-words", type=int, default=3000)
+    p.add_argument("--suffix-words", type=int, default=30)
+    p.add_argument("--max-tokens", type=int, default=196)
+    p.add_argument("--num-prefixes", type=int, default=80)
+    p.add_argument("--zipfian-alpha", type=float, default=1.5)
+    p.add_argument("--working-set-size", type=int, default=15)
+
+    p.add_argument("--num-sessions", type=int, default=50,
+                    help="Concurrent chat sessions (multi-turn)")
+    p.add_argument("--turns-per-session", type=int, default=6,
+                    help="Turns per session, prefix grows each turn (multi-turn)")
+    p.add_argument("--one-shot-fraction", type=float, default=0.25,
+                    help="Fraction of requests that are one-shot scan queries (multi-turn)")
+    p.add_argument("--system-prompt-words", type=int, default=1500,
+                    help="Length of the shared system prompt prepended to all requests (multi-turn)")
+    p.add_argument("--user-msg-words", type=int, default=80,
+                    help="Words per user turn (multi-turn)")
+    p.add_argument("--assistant-resp-words", type=int, default=250,
+                    help="Words per assistant turn (multi-turn)")
+    p.add_argument("--one-shot-prefix-words", type=int, default=400,
+                    help="Words of unique padding for one-shot queries (multi-turn)")
+
+    p.add_argument("--helm-task", choices=["copa", "piqa", "winogrande"],
+                    default="copa")
+    p.add_argument("--num-examples", type=int, default=5,
+                    help="Few-shot examples for HELM (default: 5)")
+    p.add_argument("--num-test", type=int, default=500,
+                    help="Test samples for HELM (default: 500)")
+
+    p.add_argument(
+        "--partitions", nargs="+", default=None,
+        help="Partition IDs for simple round-robin assignment on non-multi-partition "
+             "workloads. Example: --partitions model_a model_b",
+    )
+    p.add_argument(
+        "--partition-config", type=str, default=None,
+        help='JSON dict for --workload multi-partition. Each key is a partition '
+             'ID, value is {"num_requests": N, "prefix_words": W, '
+             '"num_prefixes": P, "suffix_words": S}. '
+             'Example: \'{"hog": {"num_requests": 64, "prefix_words": 200}, '
+             '"starved": {"num_requests": 16, "prefix_words": 2000}}\'',
+    )
+
+    p.add_argument("--cpu-kv-cache-space", type=int, default=4,
+                    help="CPU KV cache space in GiB (VLLM_CPU_KVCACHE_SPACE)")
+
+    p = EngineArgs.add_cli_args(p)
+
+    return p
+
+
+def main():
+    parser = create_parser()
+    args = parser.parse_args()
+
+    policy = os.environ.get("VLLM_KV_OFFLOAD_POLICY", "unknown")
+    _setup_cpu_env(args.cpu_kv_cache_space)
+
+    print(f"Policy:           {policy}")
+    print(f"Device:           {'CPU' if IS_CPU else 'GPU'}")
+    print(f"Model:            {args.model}")
+    print(f"Workload:         {args.workload}")
+
+    batch_partition_ids: list[list[str]] | list[str] | None = None
+
+    if args.workload == "multi-partition":
+        if args.partition_config is None:
+            parser.error("--partition-config is required for --workload multi-partition")
+        pcfg = json.loads(args.partition_config)
+        batches, batch_partition_ids = workload_multi_partition(
+            pcfg, args.batch_size, args.suffix_words,
+        )
+    elif args.workload == "uniform":
+        batches = workload_uniform(
+            args.num_batches, args.batch_size,
+            args.prefix_words, args.suffix_words,
+        )
+    elif args.workload == "helm":
+        batches = workload_helm(
+            args.helm_task, args.num_examples, args.num_test, args.batch_size,
+        )
+    elif args.workload == "multi-turn":
+        batches = workload_multi_turn(
+            args.num_batches, args.batch_size,
+            args.num_sessions, args.turns_per_session,
+            args.one_shot_fraction, args.system_prompt_words,
+            args.user_msg_words, args.assistant_resp_words,
+            args.one_shot_prefix_words, args.zipfian_alpha,
+        )
+    else:
+        batches = workload_patterned(
+            args.workload, args.num_batches, args.batch_size,
+            args.prefix_words, args.suffix_words, args.num_prefixes,
+            args.zipfian_alpha, args.working_set_size,
+        )
+
+    if batch_partition_ids is None and args.partitions:
+        parts = args.partitions
+        batch_partition_ids = [parts[i % len(parts)] for i in range(len(batches))]
+        print(f"Partitions:       {parts}")
+        print(f"Batch→partition:  {batch_partition_ids}")
+
+    engine_args = EngineArgs.from_cli_args(args)
+    if not engine_args.enable_prefix_caching:
+        print("WARNING: --enable-prefix-caching not set; enabling it automatically")
+        engine_args.enable_prefix_caching = True
+    engine_args.disable_log_stats = False
+
+    print(f"\nLoading {args.model}...")
+    llm = LLM.from_engine_args(engine_args)
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=args.max_tokens,
+        ignore_eos=True,
+    )
+
+    workload_label = args.workload
+    if args.workload == "helm":
+        workload_label = f"helm-{args.helm_task}"
+    elif args.workload == "multi-partition":
+        workload_label = "multi-partition"
+
+    metrics = run_benchmark(llm, batches, sampling_params, batch_partition_ids)
+    print_results(metrics, policy, workload_label)
+
+
+if __name__ == "__main__":
+    main()

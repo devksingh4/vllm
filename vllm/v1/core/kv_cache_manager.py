@@ -116,6 +116,8 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        partition_ref_caps: dict[str, int] | None = None,
+        partition_eviction_cost: dict[str, float] | None = None,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -138,6 +140,8 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            partition_ref_caps=partition_ref_caps,
+            partition_eviction_cost=partition_eviction_cost,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -151,6 +155,10 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+    def set_partition_ref_caps(self, caps: dict[str, int] | None) -> None:
+        """Update two-level per-partition ref caps on the GPU block pool (runtime)."""
+        self.block_pool.set_partition_ref_caps(caps)
 
     @property
     def usage(self) -> float:
@@ -252,7 +260,12 @@ class KVCacheManager:
             num_tokens_main_model=full_num_tokens,
         )
 
-        return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
+        return (
+            num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
+            and not self.block_pool.would_exceed_partition_cap(
+                num_blocks_to_allocate, request.cache_partition_id
+            )
+        )
 
     def allocate_slots(
         self,
@@ -371,7 +384,9 @@ class KVCacheManager:
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
         self.coordinator.remove_skipped_blocks(
-            request.request_id, total_computed_tokens
+            request.request_id,
+            total_computed_tokens,
+            request.cache_partition_id,
         )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
@@ -384,8 +399,12 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-            # Cannot allocate new blocks
+        if (
+            num_blocks_to_allocate > self.block_pool.get_num_free_blocks()
+            or self.block_pool.would_exceed_partition_cap(
+                num_blocks_to_allocate, request.cache_partition_id
+            )
+        ):
             return None
 
         if (
@@ -399,13 +418,15 @@ class KVCacheManager:
                 new_computed_blocks=new_computed_block_list,
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
+                cache_partition_id=request.cache_partition_id,
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
             num_tokens_main_model,
-            num_encoder_tokens,
+            request.cache_partition_id,
+            num_encoder_tokens=num_encoder_tokens,
         )
 
         # P/D: delay caching blocks if we have to recv from
@@ -434,10 +455,13 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self.coordinator.free(request.request_id)
+        self.coordinator.free(request.request_id, request.cache_partition_id)
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        cache_partition_id: str,
     ) -> None:
         """Remove the blocks that are no longer needed from `blocks` and replace
         the removed blocks with null_block.
@@ -446,8 +470,11 @@ class KVCacheManager:
             request_id: The request ID.
             total_computed_tokens: The total number of computed tokens, including
                 local computed tokens and external computed tokens.
+            cache_partition_id: Logical partition for freed refs (metrics).
         """
-        self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
+        self.coordinator.remove_skipped_blocks(
+            request_id, total_computed_tokens, cache_partition_id
+        )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
