@@ -260,7 +260,12 @@ class KVCacheManager:
             num_tokens_main_model=full_num_tokens,
         )
 
-        return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
+        return (
+            num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
+            and not self.block_pool.would_exceed_partition_cap(
+                num_blocks_to_allocate, request.cache_partition_id
+            )
+        )
 
     def allocate_slots(
         self,
@@ -394,8 +399,12 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-            # Cannot allocate new blocks
+        if (
+            num_blocks_to_allocate > self.block_pool.get_num_free_blocks()
+            or self.block_pool.would_exceed_partition_cap(
+                num_blocks_to_allocate, request.cache_partition_id
+            )
+        ):
             return None
 
         if (

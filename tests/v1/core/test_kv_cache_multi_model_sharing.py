@@ -9,8 +9,6 @@ These are intentionally small, deterministic checks for:
    normalized staleness favors evicting a cheaper partition's block.
 """
 
-import pytest
-
 from tests.v1.core.test_prefix_caching import make_kv_cache_config
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -27,7 +25,13 @@ def test_two_level_partition_ref_cap_allows_within_budget():
     assert pool.get_partition_block_ref_totals() == {"model_a": 3}
 
 
-def test_two_level_partition_ref_cap_rejects_over_budget():
+def test_two_level_partition_ref_cap_soft_over_budget():
+    """Exceeding the cap at the block-pool level is a soft warning, not a crash.
+
+    Prefix-cache hits can push a partition over cap without going through
+    allocation, so get_new_blocks must not raise.  The hard gate lives in
+    KVCacheManager.can_allocate / allocate_slots instead.
+    """
     pool = BlockPool(
         num_gpu_blocks=8,
         enable_caching=False,
@@ -35,8 +39,11 @@ def test_two_level_partition_ref_cap_rejects_over_budget():
         partition_ref_caps={"model_a": 2},
     )
     pool.get_new_blocks(2, "model_a")
-    with pytest.raises(ValueError, match="two-level quota"):
-        pool.get_new_blocks(1, "model_a")
+    assert pool.would_exceed_partition_cap(1, "model_a")
+    # get_new_blocks still succeeds (soft cap) with a warning
+    extra = pool.get_new_blocks(1, "model_a")
+    assert len(extra) == 1
+    assert pool.get_partition_block_ref_totals()["model_a"] == 3
 
 
 def test_two_level_dynamic_cap_adjustment():
@@ -47,9 +54,9 @@ def test_two_level_dynamic_cap_adjustment():
         partition_ref_caps={"model_a": 2},
     )
     pool.get_new_blocks(2, "model_a")
-    with pytest.raises(ValueError, match="two-level quota"):
-        pool.get_new_blocks(1, "model_a")
+    assert pool.would_exceed_partition_cap(1, "model_a")
     pool.set_partition_ref_caps({"model_a": 4})
+    assert not pool.would_exceed_partition_cap(1, "model_a")
     pool.get_new_blocks(1, "model_a")
     assert pool.get_partition_block_ref_totals()["model_a"] == 3
 
@@ -98,8 +105,10 @@ def test_kv_cache_manager_wires_partition_ref_caps():
         partition_ref_caps={"P": 2},
     )
     manager.block_pool.get_new_blocks(2, "P")
-    with pytest.raises(ValueError, match="two-level quota"):
-        manager.block_pool.get_new_blocks(1, "P")
+    assert manager.block_pool.would_exceed_partition_cap(1, "P")
+    # Block-pool level is a soft cap — allocation proceeds with warning
+    extra = manager.block_pool.get_new_blocks(1, "P")
+    assert len(extra) == 1
 
 
 def test_kv_cache_manager_set_partition_ref_caps_runtime():
@@ -111,9 +120,9 @@ def test_kv_cache_manager_set_partition_ref_caps_runtime():
         partition_ref_caps={"P": 1},
     )
     manager.block_pool.get_new_blocks(1, "P")
-    with pytest.raises(ValueError, match="two-level quota"):
-        manager.block_pool.get_new_blocks(1, "P")
+    assert manager.block_pool.would_exceed_partition_cap(1, "P")
     manager.set_partition_ref_caps({"P": 4})
+    assert not manager.block_pool.would_exceed_partition_cap(1, "P")
     manager.block_pool.get_new_blocks(1, "P")
     assert manager.block_pool.get_partition_block_ref_totals()["P"] == 2
 

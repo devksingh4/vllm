@@ -277,6 +277,21 @@ class BlockPool:
         """
         self._partition_ref_caps = dict(caps) if caps is not None else None
 
+    def would_exceed_partition_cap(
+        self, num_blocks: int, cache_partition_id: str
+    ) -> bool:
+        """Return True if allocating *num_blocks* for *cache_partition_id*
+        would exceed its two-level ref cap.
+
+        Callers should treat this the same as "not enough free blocks" and
+        defer the request rather than crashing.
+        """
+        cap = (self._partition_ref_caps or {}).get(cache_partition_id)
+        return cap is not None and (
+            self._partition_block_ref_totals.get(cache_partition_id, 0) + num_blocks
+            > cap
+        )
+
     def _note_block_partition_activity(
         self, block: KVCacheBlock, cache_partition_id: str
     ) -> None:
@@ -472,16 +487,18 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        if self._partition_ref_caps is not None:
-            cap = self._partition_ref_caps.get(cache_partition_id)
-            if cap is not None:
-                cur = self._partition_block_ref_totals.get(cache_partition_id, 0)
-                if cur + num_blocks > cap:
-                    raise ValueError(
-                        "cache_partition_id "
-                        f"{cache_partition_id!r} would exceed ref cap "
-                        f"({cur} + {num_blocks} > {cap}); two-level quota policy"
-                    )
+        if self.would_exceed_partition_cap(num_blocks, cache_partition_id):
+            cap = (self._partition_ref_caps or {})[cache_partition_id]
+            cur = self._partition_block_ref_totals.get(cache_partition_id, 0)
+            logger.warning(
+                "cache_partition_id %r over ref cap "
+                "(%d + %d > %d); proceeding (prefix-cache "
+                "hits can push a partition over cap)",
+                cache_partition_id,
+                cur,
+                num_blocks,
+                cap,
+            )
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
