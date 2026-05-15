@@ -19,61 +19,33 @@ from pathlib import Path
 BENCHMARK = str(Path(__file__).parent / "benchmark_kv_cache.py")
 
 BLOCK_SIZE = 16  # vLLM default
-TOKENS_PER_WORD = 1.5  # conservative estimate for English text
-
-# ---------------------------------------------------------------------------
-# Scenarios (workload shapes)
-# ---------------------------------------------------------------------------
-# Token budget estimates: prefix_words × TOKENS_PER_WORD × num_prefixes.
-# Prefix blocks ≈ tokens / BLOCK_SIZE (each unique prefix occupies blocks).
-# "cheap" = high-traffic tenant; "expensive" = costly-to-recompute tenant.
+TOKENS_PER_WORD = 1.5
 
 SCENARIOS: dict[str, dict] = {
-    # Balanced: equal traffic, equal prefix length.  Policies should be
-    # neutral — any TTFT difference here is noise or overhead.
-    # ~2 × 25 × 900 = 45K tokens ≈ 2812 blocks
     "balanced": {
         "cheap": {"num_requests": 60, "prefix_words": 600, "num_prefixes": 25},
         "expensive": {"num_requests": 60, "prefix_words": 600, "num_prefixes": 25},
     },
-    # Traffic skew only: cheap floods 5× more requests; both use the same
-    # prefix length so cost-aware adds nothing — only caps should help.
-    # cheap: 25 × 900 = 22.5K tok ≈ 1406 blk; expensive: 15 × 900 = 13.5K tok ≈ 843 blk
-    # Total ≈ 2249 blocks → exceeds tight (2000).
     "traffic_skew": {
         "cheap": {"num_requests": 100, "prefix_words": 600, "num_prefixes": 25},
         "expensive": {"num_requests": 20, "prefix_words": 600, "num_prefixes": 15},
     },
-    # Cost skew only: equal traffic but expensive prefixes are 10× longer.
-    # cheap: 20 × 300 = 6K tok ≈ 375 blk; expensive: 10 × 3000 = 30K tok ≈ 1875 blk
-    # Total ≈ 2250 blocks → exceeds tight (2000).
     "cost_skew": {
         "cheap": {"num_requests": 60, "prefix_words": 200, "num_prefixes": 20},
         "expensive": {"num_requests": 60, "prefix_words": 2000, "num_prefixes": 10},
     },
-    # Full skew: cheap sends 5× more AND expensive has 10× longer prefixes.
-    # cheap: 20 × 300 = 6K tok ≈ 375 blk; expensive: 10 × 3000 = 30K tok ≈ 1875 blk
-    # Total ≈ 2250 blocks → exceeds tight (2000).
     "full_skew": {
         "cheap": {"num_requests": 100, "prefix_words": 200, "num_prefixes": 20},
         "expensive": {"num_requests": 20, "prefix_words": 2000, "num_prefixes": 10},
     },
 }
 
-# ---------------------------------------------------------------------------
-# Derived: cache regimes (GPU blocks, not memory — GPU-independent)
-# ---------------------------------------------------------------------------
-# Computed from SCENARIOS so that tight always forces eviction and loose
-# always fits everything.  Using --num-gpu-blocks-override avoids dependence
-# on model size / GPU size.
-#
-# Tuning knobs (change these, not the block counts):
-TIGHT_FRAC = 0.75  # tight cache = 75% of smallest working set → eviction guaranteed
-LOOSE_MULT = 3.0  # loose cache = 3× largest working set → everything fits
+# tight always forces eviction, loose always fits.
+TIGHT_FRAC = 0.75
+LOOSE_MULT = 3.0
 
 
 def _scenario_blocks(scenario: dict) -> int:
-    """Total unique prefix blocks for one scenario."""
     total = 0
     for cfg in scenario.values():
         tokens = cfg["prefix_words"] * TOKENS_PER_WORD * cfg["num_prefixes"]
@@ -90,11 +62,6 @@ CACHE_REGIMES: dict[str, int] = {
     "loose": int(_MAX_WS * LOOSE_MULT),
 }
 
-# ---------------------------------------------------------------------------
-# Engine args common to every run.
-# --num-gpu-blocks-override is injected per-regime by the runner.
-# ---------------------------------------------------------------------------
-
 COMMON_ARGS = [
     "--model",
     "Qwen/Qwen2.5-1.5B",
@@ -110,20 +77,8 @@ COMMON_ARGS = [
     "8",
 ]
 
-# ---------------------------------------------------------------------------
-# Derived: policy conditions
-# ---------------------------------------------------------------------------
-# Caps are fractions of the tight cache.  cheap < 50% prevents monopolisation;
-# expensive > 50% lets it retain long prefixes.  Sum > 100% because caps limit
-# max, not reserve.  Under the loose regime caps rarely bind, confirming the
-# mechanism is harmless when cache is abundant.
-#
-# Cost ratio is derived from the max prefix-length ratio across scenarios
-# (i.e. how much more expensive the "expensive" partition's prefixes are to
-# recompute relative to "cheap").
-
-CHEAP_CAP_FRAC = 0.40  # cheap can pin at most 40% of tight cache
-EXPENSIVE_CAP_FRAC = 0.70  # expensive can pin at most 70% of tight cache
+CHEAP_CAP_FRAC = 0.40
+EXPENSIVE_CAP_FRAC = 0.70
 
 _TIGHT = CACHE_REGIMES["tight"]
 DEFAULT_CHEAP_CAP = int(_TIGHT * CHEAP_CAP_FRAC)
@@ -131,7 +86,6 @@ DEFAULT_EXPENSIVE_CAP = int(_TIGHT * EXPENSIVE_CAP_FRAC)
 
 
 def _max_prefix_ratio() -> float:
-    """Max ratio of expensive/cheap prefix_words across all scenarios."""
     best = 1.0
     for scen in SCENARIOS.values():
         words = {pid: cfg["prefix_words"] for pid, cfg in scen.items()}
@@ -149,7 +103,6 @@ def _build_policies(
     expensive_cap: int,
     cost_ratio: float,
 ) -> dict[str, list[str]]:
-    """Return {policy_name: extra_cli_args} for each mechanism."""
     caps = json.dumps({"cheap": cheap_cap, "expensive": expensive_cap})
     cost = json.dumps({"cheap": 1.0, "expensive": cost_ratio})
     return {
@@ -165,13 +118,7 @@ def _build_policies(
     }
 
 
-# ---------------------------------------------------------------------------
-# Working-set sanity checks
-# ---------------------------------------------------------------------------
-
-
 def _per_partition_blocks(scenario: dict) -> dict[str, int]:
-    """Estimate unique prefix blocks per partition."""
     out = {}
     for pid, cfg in scenario.items():
         tokens = cfg["prefix_words"] * TOKENS_PER_WORD * cfg["num_prefixes"]
@@ -180,12 +127,6 @@ def _per_partition_blocks(scenario: dict) -> dict[str, int]:
 
 
 def _print_pressure_table(scenarios: dict[str, dict], regimes: dict[str, int]) -> None:
-    """Print a table showing working-set vs. cache size for each scenario.
-
-    Because regimes are derived from scenarios, every scenario's working set
-    is guaranteed to exceed the tight cache by construction.  This table is
-    printed at startup so the operator can eyeball the numbers.
-    """
     tight_blocks = regimes["tight"]
     loose_blocks = regimes["loose"]
     print("\nDerived block budgets:")
@@ -206,18 +147,13 @@ def _print_pressure_table(scenarios: dict[str, dict], regimes: dict[str, int]) -
         print(
             f"  {name:<16} total={total:>5} blocks  ({parts})  [{vs_tight}, {vs_loose}]"
         )
-        assert total > tight_blocks, (
-            f"BUG: {name} working set ({total}) <= tight cache ({tight_blocks}). "
-            f"This should be impossible — check TIGHT_FRAC or scenario config."
-        )
+        assert (
+            total > tight_blocks
+        ), f"{name} working set {total} <= tight {tight_blocks}"
     print()
 
 
-# ---------------------------------------------------------------------------
-# Output parsing
-# ---------------------------------------------------------------------------
-
-# Per-partition line:  [cheap] n=80  mean=123.4ms  p50=100.0ms  p99=200.0ms
+# [cheap] n=80  mean=123.4ms  p50=100.0ms  p99=200.0ms
 _PART_RE = re.compile(
     r"\[(\S+)\]\s+n=(\d+)\s+mean=([\d.]+)ms\s+p50=([\d.]+)ms\s+p99=([\d.]+)ms"
 )
@@ -250,11 +186,6 @@ def _parse_log(text: str) -> dict:
         out["lookup_blocks"] = int(m.group(3))
         out["hit_rate_pct"] = m.group(1)
     return out
-
-
-# ---------------------------------------------------------------------------
-# Runner (one combination)
-# ---------------------------------------------------------------------------
 
 
 def _run_key(scenario: str, regime: str, policy: str) -> str:
@@ -322,17 +253,12 @@ def _run_one(
     }
 
 
-# ---------------------------------------------------------------------------
-# Summary table (grouped by scenario+regime)
-# ---------------------------------------------------------------------------
-
-
 def _print_summary(results: list[dict]) -> None:
     pids = sorted(
         {pid for r in results for pid in r.get("partitions", {})},
     )
     if not pids:
-        print("\n[WARN] No per-partition TTFT parsed — check logs.")
+        print("\n[WARN] No per-partition TTFT parsed.")
         return
 
     col = 12
@@ -341,9 +267,9 @@ def _print_summary(results: list[dict]) -> None:
         hdr += f" {pid + ' P50':>{col}} {pid + ' P99':>{col}}"
     hdr += f" {'all P50':>{col}} {'all P99':>{col}} {'time':>6}"
 
-    print(f"\n{'=' * len(hdr)}")
-    print("MULTI-MODEL POLICY SWEEP RESULTS — PER-PARTITION TTFT (ms)")
-    print(f"{'=' * len(hdr)}")
+    print("\n" + "=" * len(hdr))
+    print("MULTI-MODEL POLICY SWEEP RESULTS - PER-PARTITION TTFT (ms)")
+    print("=" * len(hdr))
     print(hdr)
     print("-" * len(hdr))
 
@@ -352,7 +278,7 @@ def _print_summary(results: list[dict]) -> None:
         group = f"{r.get('scenario', '?')}__{r.get('regime', '?')}"
         if group != prev_group:
             if prev_group:
-                print()  # blank line between scenario×regime groups
+                print()
             prev_group = group
 
         status = "OK" if r.get("ok") else ("TIMEOUT" if r.get("timed_out") else "FAIL")
@@ -374,20 +300,16 @@ def _print_summary(results: list[dict]) -> None:
     print()
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 _EPILOG = f"""
 Sweep axes (full cross-product = {len(SCENARIOS)} x {len(CACHE_REGIMES)} x 4 = {len(SCENARIOS) * len(CACHE_REGIMES) * 4} runs):
 
 SCENARIOS:
-  balanced       equal traffic, equal prefix lengths  (sanity baseline)
-  traffic_skew   cheap sends 5x more requests         (tests caps)
-  cost_skew      expensive prefixes 10x longer         (tests cost-aware)
-  full_skew      both skews combined                   (worst case)
+  balanced       equal traffic, equal prefix lengths
+  traffic_skew   cheap sends 5x more requests
+  cost_skew      expensive prefixes 10x longer
+  full_skew      both skews combined
 
-CACHE REGIMES (via --num-gpu-blocks-override, GPU-independent):
+CACHE REGIMES (via --num-gpu-blocks-override):
   tight   {CACHE_REGIMES["tight"]} blocks  (TIGHT_FRAC={TIGHT_FRAC} of smallest working set)
   loose   {CACHE_REGIMES["loose"]} blocks  (LOOSE_MULT={LOOSE_MULT}x of largest working set)
 
@@ -397,9 +319,7 @@ POLICIES:
   cost        cost-aware LRU eviction
   caps_cost   both combined
 
-All derived values (block budgets, caps, cost ratio) are computed
-automatically from the scenario definitions.  VLLM_KV_OFFLOAD_POLICY=lru
-is pinned for every run so cost-aware eviction can activate.
+VLLM_KV_OFFLOAD_POLICY=lru is pinned so cost-aware eviction can activate.
 """
 
 
@@ -490,7 +410,6 @@ def main() -> None:
             print(f"[error] unknown policy: {p!r}", file=sys.stderr)
             sys.exit(2)
 
-    # Build full plan (scenario × regime × policy)
     plan: list[tuple[str, str, str]] = [
         (sc, rg, po)
         for sc in sel_scenarios
@@ -498,7 +417,7 @@ def main() -> None:
         for po in sel_policies
     ]
 
-    # Resume: skip already-successful runs (failed/timed-out are retried).
+    # Resume: skip successful runs, retry failed/timed-out.
     done: dict[str, dict] = {}
     if results_path.exists():
         try:
